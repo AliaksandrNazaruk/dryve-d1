@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cia402-dryve-d1"
+dynamic = ["version"]
+description = "igus dryve D1 plugin for the cia402 driver framework"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+authors = [{name = "Aliaksandr Nazaruk"}]
+keywords = ["igus", "dryve-d1", "cia402", "modbus-tcp", "motor-control"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+    "Typing :: Typed",
+]
+dependencies = ["cia402>=0.1.0"]
+
+[project.urls]
+Repository = "https://github.com/AliaksandrNazaruk/dryve-d1"
+
+[tool.hatch.version]
+path = "src/cia402_dryve_d1/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cia402_dryve_d1"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+
+[[tool.mypy.overrides]]
+module = "cia402_dryve_d1.od_accessor"
+disable_error_code = ["attr-defined"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
