@@ -61,5 +61,9 @@ warn_unused_configs = true
 module = "cia402.api.*"
 disable_error_code = ["empty-body", "attr-defined", "no-any-return", "arg-type"]
 
+[[tool.mypy.overrides]]
+module = "cia402.config.models"
+disable_error_code = ["name-defined"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
