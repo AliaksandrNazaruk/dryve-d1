@@ -35,7 +35,7 @@ jobs:
 
       - name: Mypy
         run: |
-          mypy packages/cia402/src/cia402
+          cd packages/cia402 && mypy src/cia402 && cd ../..
           mypy src/dryve_d1
 
   test-cia402:
