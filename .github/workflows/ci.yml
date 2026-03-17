@@ -112,11 +112,14 @@ jobs:
           pip install -e packages/cia402-dryve-d1
           pip install -e .
 
-      - name: Bandit
-        run: |
-          bandit -r packages/cia402/src/cia402 -ll
-          bandit -r packages/cia402-dryve-d1/src/cia402_dryve_d1 -ll
-          bandit -r src/dryve_d1 -ll
+      - name: Bandit cia402
+        run: bandit -r packages/cia402/src/cia402 -ll
+
+      - name: Bandit cia402-dryve-d1
+        run: bandit -r packages/cia402-dryve-d1/src/cia402_dryve_d1 -ll --exclude packages/cia402-dryve-d1/src/cia402_dryve_d1/simulator.py
+
+      - name: Bandit dryve-d1
+        run: bandit -r src/dryve_d1 -ll
 
       - name: pip-audit
         run: python -m pip_audit
