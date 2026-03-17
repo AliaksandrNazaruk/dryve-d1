@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dryve-d1"
+dynamic = ["version"]
+description = "Async Python driver for igus dryve D1 motor controllers (Modbus/TCP, CiA 402)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+authors = [{name = "Aliaksandr Nazaruk"}]
+keywords = ["igus", "dryve-d1", "modbus-tcp", "cia402", "motor-control", "canopen", "stepper", "servo"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+dependencies = ["pydantic>=2.0,<3"]
+
+[project.urls]
+Repository = "https://github.com/AliaksandrNazaruk/dryve-d1"
+Issues = "https://github.com/AliaksandrNazaruk/dryve-d1/issues"
+Changelog = "https://github.com/AliaksandrNazaruk/dryve-d1/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.0",
+    "ruff>=0.15",
+    "mypy>=1.19",
+]
+
+[tool.hatch.version]
+path = "src/dryve_d1/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dryve_d1"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = "dryve_d1.api.*"
+disable_error_code = ["empty-body", "attr-defined", "no-any-return", "arg-type"]
+
+[[tool.mypy.overrides]]
+module = "dryve_d1.config.models"
+disable_error_code = ["name-defined"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["simulator: requires Modbus simulator or hardware"]
