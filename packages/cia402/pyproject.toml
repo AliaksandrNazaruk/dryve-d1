@@ -56,5 +56,10 @@ python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 
+# API layer uses mixin pattern with cross-mixin attribute access
+[[tool.mypy.overrides]]
+module = "cia402.api.*"
+disable_error_code = ["empty-body", "attr-defined", "no-any-return", "arg-type"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
