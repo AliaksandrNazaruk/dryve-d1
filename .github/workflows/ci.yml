@@ -21,16 +21,49 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Install all packages
+        run: |
+          pip install -e ".[dev]"
+          pip install -e packages/cia402[dev]
+          pip install -e packages/cia402-dryve-d1
 
       - name: Ruff
-        run: ruff check src/ tests/
+        run: |
+          ruff check packages/cia402/src/ tests/test_cia402/
+          ruff check packages/cia402-dryve-d1/src/
+          ruff check src/ tests/unit/ tests/property/
 
       - name: Mypy
-        run: mypy src/dryve_d1
+        run: |
+          mypy packages/cia402/src/cia402
+          mypy src/dryve_d1
 
-  test:
+  test-cia402:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install packages
+        run: |
+          pip install -e packages/cia402[dev]
+
+      - name: Run generic CiA 402 unit tests
+        run: pytest tests/test_cia402/unit -q
+
+      - name: Run generic CiA 402 property tests
+        run: pytest tests/test_cia402/property -q
+
+  test-dryve-d1:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -45,10 +78,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Install packages
+        run: |
+          pip install -e ".[dev]"
+          pip install -e packages/cia402
+          pip install -e packages/cia402-dryve-d1
 
-      - name: Run unit tests
+      - name: Run igus dryve D1 unit tests
+        run: pytest tests/test_cia402_dryve_d1/unit -m "not simulator" -q
+
+      - name: Run original unit tests
         run: pytest tests/unit -m "not simulator" -q
 
       - name: Run property tests
@@ -66,13 +105,18 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install dependencies
+      - name: Install packages
         run: |
           pip install bandit pip-audit
+          pip install -e packages/cia402
+          pip install -e packages/cia402-dryve-d1
           pip install -e .
 
       - name: Bandit
-        run: bandit -r src/dryve_d1 -ll
+        run: |
+          bandit -r packages/cia402/src/cia402 -ll
+          bandit -r packages/cia402-dryve-d1/src/cia402_dryve_d1 -ll
+          bandit -r src/dryve_d1 -ll
 
       - name: pip-audit
         run: python -m pip_audit
