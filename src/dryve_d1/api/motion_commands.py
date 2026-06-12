@@ -254,30 +254,19 @@ class MotionCommandsMixin:
     async def _ensure_mode_pp(self, status: dict[str, bool], op_id: str) -> dict[str, bool]:
         """Ensure the drive is in OPERATION_ENABLED with PP mode active."""
         need_enable = not status.get("operation_enabled", False)
-        wrong_mode = False
-
-        if not need_enable:
-            try:
-                current_mode = await self.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
-                wrong_mode = (current_mode != self._MODE_PP)
-            except Exception:
-                wrong_mode = True
+        
+        try:
+            current_mode = await self.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+            wrong_mode = (current_mode != self._MODE_PP)
+        except Exception:
+            wrong_mode = True
 
         if need_enable or wrong_mode:
-            sm = self._require_sm()
-            if wrong_mode and not need_enable:
-                _LOGGER.info(
-                    "move_to_position[%s]: mode!=PP, cycling SM for clean transition", op_id,
-                )
-                await sm.shutdown()
-
             await self.write_u8(int(ODIndex.MODES_OF_OPERATION), self._MODE_PP, 0)
             await asyncio.sleep(self._cfg.mode_settle_delay_s)
-            _LOGGER.debug("move_to_position[%s]: mode=PP written before enable", op_id)
-
-            await self.enable_operation()
+            if need_enable:
+                await self.enable_operation()
             status = await self.get_status_live()
-            _LOGGER.info("move_to_position[%s]: enable_operation completed", op_id)
 
         return status
 

@@ -149,15 +149,8 @@ class Homing:
             attained = _bit(sw, 12)
             # DS402 commonly uses bit 13 as "homing error" (even if our SWBit labels it differently)
             error = _bit(sw, 13)
-            # Some simulators/drives signal homing completion only via target_reached (bit 10)
-            # without ever setting bit 12. Accept target_reached as an alternative completion signal.
-            target_reached = _bit(sw, 10)
             if attained or error:
                 return HomingResult(attained=attained, error=error, statusword=int(sw) & 0xFFFF)
-            if target_reached:
-                # target_reached without attained — treat as successful homing
-                # (common with simulators and some drives that use method 35)
-                return HomingResult(attained=True, error=False, statusword=int(sw) & 0xFFFF)
             if monotonic_s() >= deadline:
                 raise TimeoutError(f"Timeout waiting for homing done. statusword=0x{int(sw) & 0xFFFF:04X}")
             await asyncio.sleep(self._cfg.poll_interval_s)
