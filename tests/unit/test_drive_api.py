@@ -604,8 +604,8 @@ class TestMoveToPositionHelpers:
         assert result is status  # unchanged
 
     @pytest.mark.asyncio
-    async def test_ensure_mode_pp_wrong_mode_cycles_sm(self, mock_drive):
-        """When in wrong mode, SM is cycled down and mode is written."""
+    async def test_ensure_mode_pp_wrong_mode_writes_directly(self, mock_drive):
+        """When in wrong mode, mode is written directly without SM cycle."""
         status = {"operation_enabled": True, "fault": False, "remote": True}
         mock_drive.read_i8 = AsyncMock(return_value=3)  # PV mode, not PP
         mock_drive._sm.shutdown = AsyncMock()
@@ -617,8 +617,9 @@ class TestMoveToPositionHelpers:
 
         await mock_drive._ensure_mode_pp(status, "op1")
 
-        mock_drive._sm.shutdown.assert_awaited_once()
-        mock_drive.write_u8.assert_awaited_once()
+        mock_drive._sm.shutdown.assert_not_called()
+        mock_drive.write_u8.assert_awaited_once_with(int(ODIndex.MODES_OF_OPERATION), 1, 0)
+        mock_drive.enable_operation.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

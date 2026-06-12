@@ -248,11 +248,11 @@ class TestGatewayByteCountTolerance:
 # ---------------------------------------------------------------------------
 
 class TestHomingTargetReachedCompletion:
-    """Verify homing accepts target_reached (bit 10) as alternative completion."""
+    """Verify homing do not accept target_reached (bit 10) as alternative completion."""
 
     @pytest.mark.asyncio
-    async def test_wait_done_accepts_target_reached(self):
-        """Homing should complete when target_reached (bit 10) is set, even without bit 12."""
+    async def test_wait_done_requires_homing_attained(self):
+        """Homing should NOT complete on target_reached (bit 10) alone — bit 12 is required."""
         from dryve_d1.motion.homing import Homing, HomingConfig
 
         class FakeOD:
@@ -265,10 +265,9 @@ class TestHomingTargetReachedCompletion:
             async def write_u32(self, index, value, subindex=0): pass
 
         homing = Homing(FakeOD(), config=HomingConfig(poll_interval_s=0.0, timeout_s=1.0))
-        result = await homing.wait_done(timeout_s=1.0)
+        with pytest.raises(TimeoutError):
+            await homing.wait_done(timeout_s=0.1)
 
-        assert result.attained is True, "Homing should report attained=True via target_reached"
-        assert result.error is False
 
     @pytest.mark.asyncio
     async def test_wait_done_accepts_bit12(self):
