@@ -93,7 +93,7 @@ class ProfilePosition:
             relative: if True, interpret as relative move (CW bit 6)
             immediate: if True, set CW bit 5 (change set immediately) when pulsing new set-point
             timeout_s: override default move timeout
-        
+
         Raises:
             ValueError: If relative=False and target_position < 0 (absolute position cannot be negative)
         """
@@ -103,13 +103,13 @@ class ProfilePosition:
                 f"Absolute position cannot be negative (relative=False, target_position={target_position}). "
                 "Per manual requirement: if Absolute (bit6=0), position must be >= 0 after homing."
             )
-        
+
         await self.ensure_mode()
         await self.configure()
-        
+
         _LOGGER.info("PP: move_to target=%d relative=%s immediate=%s", target_position, relative, immediate)
         await self._od.write_i32(int(ODIndex.TARGET_POSITION), int(target_position), 0)
-        
+
         # Barrier cycle: per manual, wait one system cycle after configuration before start
         # Per manual requirement: after parameterizing mode objects, wait one system cycle
         # before sending Start Command via Controlword bit 4.
@@ -121,7 +121,7 @@ class ProfilePosition:
         # Per manual: after Operation Enabled, bits 0..3 must always be sent
         # Start with base containing hold bits (0x000F)
         base = cw_enable_operation()  # 0x000F = bits 0,1,2,3 set
-        
+
         if immediate:
             base = cw_set_bits(base, CWBit.CHANGE_SET_IMMEDIATELY)
         else:
@@ -185,11 +185,11 @@ class ProfilePosition:
 
     async def halt(self, *, enabled: bool = True) -> None:
         """Halt movement in Profile Position mode using Controlword HALT bit (bit 8).
-        
+
         In Profile Position mode, the HALT bit (bit 8) is typically used to stop
         movement immediately, rather than quick_stop. This is the standard CiA402
         method for stopping motion in profile modes.
-        
+
         Args:
             enabled: If True, set HALT bit to stop movement. If False, clear HALT bit.
         """
@@ -202,15 +202,15 @@ class ProfilePosition:
 
     async def stop(self) -> None:
         """Stop movement in Profile Position mode using normal deceleration.
-        
+
         According to the manual, "Stop" command stops movement with a pre-set rate
         of deceleration (Profile Deceleration, 0x6084). This is different from
         Quick Stop which uses Quick Stop Deceleration (0x6085).
-        
+
         In Profile Position mode, the standard way to stop with normal deceleration
         is to use the HALT bit (bit 8). The drive will decelerate using the configured
         Profile Deceleration value.
-        
+
         Note: This method uses HALT bit which is the standard CiA402 method for
         stopping motion in profile modes with normal deceleration.
         """
@@ -218,11 +218,11 @@ class ProfilePosition:
 
     async def _wait_start_acknowledgment(self, *, timeout_s: float = 0.5) -> bool:
         """Wait for Start command acknowledgment (M3: PP handshake).
-        
+
         Per manual: after Start (bit4), the drive should:
         - Reset bit10 (target_reached) OR
         - Set bit12 (op_mode_specific) to confirm command acceptance
-        
+
         Returns True if acknowledgment was observed (bit10 transitioned to 0
         or motion already completed),
         False if timed out without seeing bit10 clear.
@@ -235,7 +235,7 @@ class ProfilePosition:
             # Command acknowledged if: bit10 cleared OR bit12 set
             if not target_reached or op_mode_specific:
                 return True
-            
+
             if monotonic_s() >= deadline:
                 # Timeout: bit10 never cleared.  This can happen when the
                 # move completes faster than one poll cycle (the transient
@@ -251,8 +251,6 @@ class ProfilePosition:
                     target_reached, target_pos, actual_pos,
                     abs(actual_pos - target_pos),
                 )
-                if target_reached and abs(actual_pos - target_pos) <= 250:
-                    return True  # move completed during the ack window
                 return False
             await asyncio.sleep(self._cfg.poll_interval_s)
 
@@ -271,6 +269,10 @@ class ProfilePosition:
         # a previous motion), we MUST wait for bit10=0 first, then wait for the
         # genuine bit10=1 rising edge.  Without this, a stale bit10=1 after
         # homing or a previous move causes an instant false "target reached".
+        # Edge case: short moves can complete within a single poll cycle,
+        # so bit10 goes 1→0→1 faster than we can observe.  We therefore also
+        # check actual position against the target — if bit10=1 AND we are
+        # already at the target, the fast move completed; declare success.
         if not _ack_seen:
             while True:
                 if self._abort is not None and self._abort.is_set():
@@ -278,6 +280,20 @@ class ProfilePosition:
                 sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
                 if not _bit(sw, int(SWBit.TARGET_REACHED)):
                     break  # bit10 finally cleared → now wait for real rising edge
+                # Fast-move check: bit10=True but we may have missed the 0 transition
+                # TODO: we should rely here on controler positioning window value
+                if _bit(sw, int(SWBit.TARGET_REACHED)):
+                    target_pos = await self._od.read_i32(
+                        int(ODIndex.TARGET_POSITION), 0)
+                    actual_pos = await self._od.read_i32(
+                        int(ODIndex.POSITION_ACTUAL_VALUE), 0)
+                    if actual_pos == target_pos:
+                        _LOGGER.info(
+                            "PP: target reached (fast move — bit10=0 transition "
+                            "not observed; actual=%d == target=%d)",
+                            actual_pos, target_pos,
+                        )
+                        return
                 if _bit(sw, int(SWBit.FAULT)):
                     decoded = decode_statusword(sw)
                     raise RuntimeError(
@@ -303,7 +319,7 @@ class ProfilePosition:
             if _bit(sw, int(SWBit.TARGET_REACHED)):
                 _LOGGER.info("PP: target reached")
                 return
-            
+
             # Check for fault condition
             if _bit(sw, int(SWBit.FAULT)):
                 decoded = decode_statusword(sw)
@@ -311,7 +327,7 @@ class ProfilePosition:
                     f"Fault detected while waiting for target reached. "
                     f"statusword=0x{int(sw) & 0xFFFF:04X}, flags={decoded}"
                 )
-            
+
             if loop_time >= deadline:
                 # Provide more diagnostic information on timeout
                 decoded = decode_statusword(sw)
