@@ -64,7 +64,19 @@ class ProfilePosition:
         await asyncio.sleep(max(0.01, float(self._cfg.mode_settle_s)))
         deadline = monotonic_s() + float(self._cfg.mode_set_timeout_s)
         while True:
-            mode_disp = await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+            try:
+                mode_disp = await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+            except Exception as e:
+                # The 0x6061 read itself failed. With verify_mode=False this must
+                # not abort the move — fall back to the delay-only path (the
+                # set-point handshake gates the move). verify_mode=True is strict.
+                if self._cfg.verify_mode:
+                    raise
+                _LOGGER.warning(
+                    "PP: mode display 0x6061 read failed (%s); proceeding after "
+                    "settle — set-point handshake will gate the move", e,
+                )
+                return
             if mode_disp == MODE_PROFILE_POSITION:
                 return
             if monotonic_s() >= deadline:
