@@ -293,9 +293,9 @@ class DryveD1(
                 # software limits from DryveD1Config still guard motion.
                 _LOGGER.warning(
                     "Position limit registers report min=%d >= max=%d "
-                    "(0x607B / 0x607D).  The device may not support these "
-                    "registers or returns them as 16-bit values.  Software "
-                    "position limits from config will be used instead.",
+                    "(0x607B sub1/sub2).  The device may not have a stroke "
+                    "configured.  Software position limits from config will be "
+                    "used instead.",
                     min_pos, max_pos,
                 )
         except Exception as e:

@@ -64,12 +64,11 @@ OBJECT_SIZES = {
     0x6084: 4,  # Profile deceleration (often used by clients)
     0x60FF: 4,  # Target velocity
     0x6098: 1,  # Homing method (client may write 0x23 etc.)
-    0x607B: 4,  # Software position limit min (common pattern in your logs)
-    0x607D: 4,  # Software position limit max (common pattern in your logs)
+    0x607B: 4,  # Position Range Limit (ARRAY): sub1=min, sub2=max (dryve has no 0x607D)
     0x2014: 2,  # custom diag/status code (legacy: 1 OK, 0x23 homing running)
 }
 
-SIGNED_32 = {0x6064, 0x606C, 0x607A, 0x6081, 0x6083, 0x6084, 0x60FF, 0x607B, 0x607D}
+SIGNED_32 = {0x6064, 0x606C, 0x607A, 0x6081, 0x6083, 0x6084, 0x60FF, 0x607B}
 SIGNED_8 = {0x6060, 0x6061}
 
 # DS402 statusword bits (minimal set)
@@ -85,6 +84,7 @@ SW_REMOTE = 1 << 9
 SW_TARGET_REACHED = 1 << 10
 SW_INTERNAL_LIMIT_ACTIVE = 1 << 11
 SW_HOMING_ATTAINED = 1 << 12
+SW_SETPOINT_ACK = 1 << 12  # PP mode: bit12 = "Setpoint applied" (manual §5.6.8); same bit, mode-specific
 SW_HOMING_ERROR = 1 << 13
 
 
@@ -166,6 +166,12 @@ class FakeDriveState:
         self.is_moving: bool = False
         self.target_reached: bool = True
 
+        # PP set-point acknowledge (Statusword bit12 in Profile Position mode).
+        # Latched True on the Controlword bit4 rising edge while a set-point is
+        # accepted, and cleared when bit4 is released (manual §5.6.10.2). Modeled
+        # explicitly so the closed-loop Start handshake is actually exercised.
+        self.pp_setpoint_ack: bool = False
+
         # Homing
         self.homed: bool = False
         self.homing_error: bool = False
@@ -242,7 +248,13 @@ class FakeDriveState:
 
             last_new_sp = bool(self._last_controlword & (1 << 4))
             rising_edge_new_sp = (new_sp and not last_new_sp)
+            falling_edge_new_sp = (last_new_sp and not new_sp)
             self._last_controlword = cw
+
+            # PP set-point acknowledge (bit12) is released when the master resets
+            # bit4 (manual §5.6.10.2: "The D1 resets Bit 12 automatically").
+            if falling_edge_new_sp:
+                self.pp_setpoint_ack = False
 
             if fault_reset:
                 self.fault = False
@@ -439,6 +451,7 @@ class FakeDriveState:
         self.target_velocity = 0
         self.velocity = 0
         self.is_moving = False
+        self.pp_setpoint_ack = False
 
     # (jog thread removed; engine handles PV)
 
@@ -476,6 +489,9 @@ class FakeDriveState:
         self._pp_started_at = time.time()
         self.is_moving = True
         self.target_reached = False
+        # Acknowledge the captured set-point (Statusword bit12). Latched until
+        # the master releases Controlword bit4 (manual §5.6.10.2).
+        self.pp_setpoint_ack = True
 
     def _start_homing_locked(self):
         self._pv_active = False
@@ -540,6 +556,10 @@ class FakeDriveState:
                 if self.homing_error:
                     sw |= SW_HOMING_ERROR
 
+            # PP set-point acknowledge (bit12 "Setpoint applied") while latched.
+            if self.op_mode == 1 and self.pp_setpoint_ack:
+                sw |= SW_SETPOINT_ACK
+
             return sw & 0xFFFF
 
     def sdo_read(self, index_hi: int, index_lo: int, subindex: int, length: int) -> bytes:
@@ -571,9 +591,13 @@ class FakeDriveState:
             if idx == 0x6098:
                 return struct.pack("<B", int(self.homing_method) & 0xFF)
             if idx == 0x607B:
-                return struct.pack("<i", int(self.soft_limit_min))
-            if idx == 0x607D:
-                return struct.pack("<i", int(self.soft_limit_max))
+                # Position Range Limit ARRAY (dryve manual p.174):
+                # sub0=number of entries, sub1=min, sub2=max.
+                if subindex == 1:
+                    return struct.pack("<i", int(self.soft_limit_min))
+                if subindex == 2:
+                    return struct.pack("<i", int(self.soft_limit_max))
+                return struct.pack("<i", 2)  # sub0: number of entries (Const)
 
         # fallback OD
         with self._od_lock:
@@ -622,14 +646,15 @@ class FakeDriveState:
                 return
 
             if idx == 0x607B:
-                self.soft_limit_min = struct.unpack("<i", raw[:4].ljust(4, b"\x00"))[0]
-                # clamp current pos if needed
-                self._clamp_to_soft_limits_locked()
-                return
-
-            if idx == 0x607D:
-                self.soft_limit_max = struct.unpack("<i", raw[:4].ljust(4, b"\x00"))[0]
-                self._clamp_to_soft_limits_locked()
+                # Position Range Limit ARRAY (dryve manual p.174): sub1=min,
+                # sub2=max. sub0 is Const (number of entries) — ignore writes.
+                val = struct.unpack("<i", raw[:4].ljust(4, b"\x00"))[0]
+                if subindex == 1:
+                    self.soft_limit_min = val
+                    self._clamp_to_soft_limits_locked()
+                elif subindex == 2:
+                    self.soft_limit_max = val
+                    self._clamp_to_soft_limits_locked()
                 return
 
             if idx == 0x6040:

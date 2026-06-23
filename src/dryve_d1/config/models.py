@@ -62,9 +62,9 @@ class MotionLimits(BaseModel):
     Units are *drive units* (whatever the device is configured for).
     Provide these from commissioning parameters or vendor documentation.
 
-    For software position limits in the drive (hardware-enforced):
-    - min_position_limit: Minimum position limit — written to ODIndex.MIN_POSITION_LIMIT (0x607B)
-    - max_position_limit: Maximum position limit — written to ODIndex.MAX_POSITION_LIMIT (0x607D)
+    For the drive's Position Range Limit (dryve D1 manual p.174, object 0x607B):
+    - min_position_limit: written to ODIndex.POSITION_RANGE_LIMIT sub1 (manual requires 0)
+    - max_position_limit: written to ODIndex.POSITION_RANGE_LIMIT sub2 (the stroke)
     - If None, software limits are not configured in the drive
     """
 
@@ -75,8 +75,8 @@ class MotionLimits(BaseModel):
 
     # Software position limits (hardware-enforced in drive).
     # Canonical register mapping: see od.indices.ODIndex.
-    min_position_limit: int | None = Field(default=0)       # ODIndex.MIN_POSITION_LIMIT (0x607B)
-    max_position_limit: int | None = Field(default=120000)  # ODIndex.MAX_POSITION_LIMIT (0x607D)
+    min_position_limit: int | None = Field(default=0)       # 0x607B sub1 (must be 0)
+    max_position_limit: int | None = Field(default=120000)  # 0x607B sub2 (stroke)
 
     def clamp_position(self, pos: int) -> int:
         if self.max_abs_position is None:

@@ -44,9 +44,18 @@ class ODIndex(IntEnum):
     # --- Optional: following error / limits ---
     FOLLOWING_ERROR_ACTUAL_VALUE = 0x60F4  # optional
     
-    # --- Software position limits (CiA 402) ---
-    MIN_POSITION_LIMIT = 0x607B  # Min position limit (INT32, RW)
-    MAX_POSITION_LIMIT = 0x607D  # Max position limit (INT32, RW)
-    
+    # --- Position Range Limit (dryve D1 manual §6, p.174) ---
+    # A CiA402 ARRAY at 0x607B: sub0=count(Const=2), sub1=min, sub2=max.
+    # The dryve D1 has NO 0x607D "Software Position Limit" object — accessing
+    # 0x607D, or writing the Const sub0, returns gateway error func=0xAB/0xFF.
+    # Use the POSITION_RANGE_LIMIT_*_SUB subindices below.
+    POSITION_RANGE_LIMIT = 0x607B  # min=sub1, max=sub2 (INT32, RWW)
+
     # --- Vendor-specific (dryve D1) ---
     HOMING_STATUS = 0x2014  # dryve D1 specific: homing status (UINT16, RO)
+
+
+# Subindices for ODIndex.POSITION_RANGE_LIMIT (0x607B array). Manual p.174:
+# sub1 min ("the value 0 must be entered in sub-index 1"), sub2 max (stroke).
+POSITION_RANGE_LIMIT_MIN_SUB = 1
+POSITION_RANGE_LIMIT_MAX_SUB = 2
