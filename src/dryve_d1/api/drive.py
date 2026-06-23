@@ -293,13 +293,33 @@ class DryveD1(
                 # software limits from DryveD1Config still guard motion.
                 _LOGGER.warning(
                     "Position limit registers report min=%d >= max=%d "
-                    "(0x607B / 0x607D).  The device may not support these "
-                    "registers or returns them as 16-bit values.  Software "
-                    "position limits from config will be used instead.",
+                    "(0x607B sub1/sub2).  The device may not have a stroke "
+                    "configured.  Software position limits from config will be "
+                    "used instead.",
                     min_pos, max_pos,
                 )
         except Exception as e:
             _LOGGER.warning("Post-connect validation: failed to read position limits: %s", e)
+
+        try:
+            pos_window = await self.read_i32(int(ODIndex.POSITION_WINDOW))
+            _LOGGER.info("Post-connect validation: position window (0x6067) = %s", pos_window)
+            if self._pp is not None:
+                self._pp.set_drive_position_window(pos_window)
+            # Warn if the window is implausibly large vs the stroke: the drive
+            # then treats far-off positions as "Target Reached" and may not move
+            # (manual p.172). This is a drive-side config issue, not the driver.
+            min_pos, max_pos = self._resolve_position_limits()
+            stroke = max_pos - min_pos
+            if stroke > 0 and pos_window is not None and pos_window > stroke // 2:
+                _LOGGER.warning(
+                    "Position window (0x6067=%d) is very large relative to the "
+                    "stroke (%d..%d). The drive may report Target Reached without "
+                    "moving — check the Position Window on the drive's Axis page.",
+                    pos_window, min_pos, max_pos,
+                )
+        except Exception as e:
+            _LOGGER.warning("Post-connect validation: failed to read position window (0x6067): %s", e)
 
         try:
             homed = await self.is_homed()

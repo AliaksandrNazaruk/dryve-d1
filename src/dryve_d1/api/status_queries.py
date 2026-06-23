@@ -9,7 +9,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from ..od.indices import ODIndex
+from ..od.indices import (
+    ODIndex,
+    POSITION_RANGE_LIMIT_MAX_SUB,
+    POSITION_RANGE_LIMIT_MIN_SUB,
+)
 from ..od.statusword import decode_statusword, infer_cia402_state
 from ..transport.clock import monotonic_s
 
@@ -186,22 +190,32 @@ class StatusQueriesMixin:
     # ---- position limits ----
 
     async def set_position_limits(self, min_position: int, max_position: int) -> None:
-        """Set software position limits in the drive (0x607B / 0x607D)."""
+        """Set the drive's Position Range Limit (0x607B sub1=min, sub2=max).
+
+        Per dryve D1 manual p.174 this is a single ARRAY object — NOT the
+        generic CiA402 0x607B/0x607D pair. The manual also requires the min
+        (sub1) to be 0; a non-zero min is written as-is but warned about.
+        """
         if not self.is_connected:  # type: ignore[attr-defined]
             raise RuntimeError("Not connected")
         if min_position >= max_position:
             raise ValueError(
                 f"min_position ({min_position}) must be less than max_position ({max_position})"
             )
-        await self.write_i32(int(ODIndex.MIN_POSITION_LIMIT), int(min_position), 0)  # type: ignore[attr-defined]
-        await self.write_i32(int(ODIndex.MAX_POSITION_LIMIT), int(max_position), 0)  # type: ignore[attr-defined]
+        if min_position != 0:
+            _LOGGER.warning(
+                "set_position_limits: dryve D1 requires 0x607B sub1 (min) == 0; "
+                "got %d — writing as-is, drive may reject or ignore", min_position,
+            )
+        await self.write_i32(int(ODIndex.POSITION_RANGE_LIMIT), int(min_position), POSITION_RANGE_LIMIT_MIN_SUB)  # type: ignore[attr-defined]
+        await self.write_i32(int(ODIndex.POSITION_RANGE_LIMIT), int(max_position), POSITION_RANGE_LIMIT_MAX_SUB)  # type: ignore[attr-defined]
 
     async def get_position_limits(self) -> tuple[int, int]:
-        """Get current software position limits from the drive."""
+        """Get the drive's Position Range Limit (0x607B sub1=min, sub2=max)."""
         if not self.is_connected:  # type: ignore[attr-defined]
             raise RuntimeError("Not connected")
-        min_pos = await self.read_i32(int(ODIndex.MIN_POSITION_LIMIT), 0)
-        max_pos = await self.read_i32(int(ODIndex.MAX_POSITION_LIMIT), 0)
+        min_pos = await self.read_i32(int(ODIndex.POSITION_RANGE_LIMIT), POSITION_RANGE_LIMIT_MIN_SUB)
+        max_pos = await self.read_i32(int(ODIndex.POSITION_RANGE_LIMIT), POSITION_RANGE_LIMIT_MAX_SUB)
         return (min_pos, max_pos)
 
     def _resolve_position_limits(self) -> tuple[int, int]:
