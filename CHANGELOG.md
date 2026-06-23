@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `delta <= 250` position heuristic masked the failure as success. A set-point
   that is never acknowledged now raises `TimeoutError` instead of silently
   reporting a move that never happened.
+  - Completion is confirmed against the **actual position**, not the status
+    bits alone: real dryve hardware sets bit 12 (Set-point Acknowledge) while
+    bit 10 (Target Reached) is still stale-1 from the previous motion — even
+    for a genuine move (statusword `0x1627`). Trusting the bits there reported
+    a phantom "reached" without moving. `wait_target_reached()` now requires
+    bit 10 set **and** the actual position within `position_reached_window`
+    (default 100) of the target.
 - **Position Range Limit addressing**: `set_position_limits()` /
   `get_position_limits()` now use object `0x607B` sub-index 1 (min) and 2 (max),
   per the dryve D1 manual (p.174). The drive has no `0x607D` object; the old

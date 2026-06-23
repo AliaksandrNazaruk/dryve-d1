@@ -598,119 +598,102 @@ class TestAbortEventStopsWaitLoop:
 
 # ---------------------------------------------------------------------------
 # Bug 8: Stale target_reached causes false move success after homing
-# Root cause (real hardware): the old open-loop pulse + delta<=250 heuristic
-# could read a stale bit10 (or a coincidentally-near position) and declare
-# "success" without the motor moving.
-# Fix (manual §5.6.10.2): closed-loop Start handshake. After setting
-# Controlword bit4 (held high), the drive resets bit10 AND sets bit12
-# "Set-point Acknowledge".  _wait_setpoint_ack() therefore requires bit10 to
-# CLEAR or bit12 to SET — a stale bit10=1 is never accepted as ack, so it can
-# no longer produce a false positive (it raises TimeoutError instead). No
-# position-delta heuristic is used.  wait_target_reached(motion_started=...)
-# then either waits for bit10=1 (moving) or returns immediately (no motion).
+# Root cause (real hardware, two iterations):
+#   (a) the old open-loop pulse + delta<=250 heuristic declared success on a
+#       stale bit10 / coincidental position; and
+#   (b) the first fix then assumed "bit12 set while bit10 still set => already
+#       at target" — but the dryve sets bit12 (Set-point Acknowledge) while
+#       bit10 is STILL stale-1 even for a genuine move (statusword 0x1627),
+#       so every move reported "reached" instantly without moving.
+# Fix (manual §5.6.10.2): _wait_setpoint_ack() only gates the bit4 release
+# (ack = bit12 set OR bit10 cleared, else TimeoutError). Completion is decided
+# by wait_target_reached(): bit10 set AND actual position within
+# position_reached_window of the target — the bits alone are not trusted.
 # ---------------------------------------------------------------------------
 
 # Statusword fixtures (bits over an Operation-Enabled + Remote base 0x0027):
 _SW_OE_REMOTE = 0x0027            # op enabled + remote, bit10=0, bit12=0 (moving)
 _SW_TARGET_REACHED = 0x0427       # + bit10 (target reached / stale after homing)
 _SW_SETPOINT_ACK = 0x1027         # + bit12 (set-point applied), bit10=0
-_SW_ACK_NO_MOTION = 0x1427        # + bit12 AND bit10 (acked, target==current)
+_SW_ACK_STALE = 0x1427            # + bit12 AND bit10 (Vincent's 0x1627-class: acked, bit10 stale)
 
 
 class TestStaleTargetReachedPrevention:
-    """Verify that a stale target_reached bit does NOT cause false move success."""
+    """Verify a stale target_reached bit does NOT cause false move success."""
 
     @pytest.mark.asyncio
-    async def test_setpoint_ack_returns_true_when_bit10_clears(self):
-        """_wait_setpoint_ack returns True (moving) when bit10 transitions to 0."""
+    async def test_setpoint_ack_confirms_on_bit12(self):
+        """Ack succeeds when bit12 is set even if bit10 is still 1 (real HW)."""
+        from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
+
+        od = MagicMock()
+        od.read_u16 = AsyncMock(return_value=_SW_ACK_STALE)  # bit12=1 AND bit10=1
+        pp = ProfilePosition(od, config=ProfilePositionConfig(poll_interval_s=0.0))
+        await pp._wait_setpoint_ack(timeout_s=2.0)  # returns (no raise)
+
+    @pytest.mark.asyncio
+    async def test_setpoint_ack_confirms_on_bit10_clear(self):
+        """Ack succeeds when bit10 transitions to 0."""
         from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
 
         od = MagicMock()
         od.read_u16 = AsyncMock(side_effect=[_SW_TARGET_REACHED, _SW_OE_REMOTE])
-
         pp = ProfilePosition(od, config=ProfilePositionConfig(poll_interval_s=0.0))
-        result = await pp._wait_setpoint_ack(timeout_s=2.0)
-        assert result is True, "ack via bit10 clear should report motion started"
+        await pp._wait_setpoint_ack(timeout_s=2.0)
 
     @pytest.mark.asyncio
-    async def test_setpoint_ack_returns_false_when_acked_without_motion(self):
-        """_wait_setpoint_ack returns False when bit12 set while bit10 stays set."""
-        from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
-
-        od = MagicMock()
-        od.read_u16 = AsyncMock(return_value=_SW_ACK_NO_MOTION)  # bit12=1 AND bit10=1
-
-        pp = ProfilePosition(od, config=ProfilePositionConfig(poll_interval_s=0.0))
-        result = await pp._wait_setpoint_ack(timeout_s=2.0)
-        assert result is False, "ack via bit12 with bit10 held should report no motion"
-
-    @pytest.mark.asyncio
-    async def test_setpoint_ack_raises_on_stale_bit10_no_ack(self):
-        """REGRESSION: stale bit10=1 with no bit12 must raise, not succeed."""
+    async def test_setpoint_ack_raises_when_never_acked(self):
+        """Stale bit10=1 with no bit12 (Start rejected) raises TimeoutError."""
         from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
 
         od = MagicMock()
         od.read_u16 = AsyncMock(return_value=_SW_TARGET_REACHED)  # bit10 stuck, bit12 never set
         od.read_i32 = AsyncMock(side_effect=[10000, 0])           # diagnostics only
-
-        cfg = ProfilePositionConfig(poll_interval_s=0.0)
-        pp = ProfilePosition(od, config=cfg)
+        pp = ProfilePosition(od, config=ProfilePositionConfig(poll_interval_s=0.0))
         with pytest.raises(TimeoutError, match="set-point not acknowledged"):
             await pp._wait_setpoint_ack(timeout_s=0.05)
 
     @pytest.mark.asyncio
-    async def test_setpoint_ack_no_false_positive_when_positions_match(self):
-        """REGRESSION: stale bit10 + matching position must STILL raise.
+    async def test_wait_target_reached_requires_position_not_just_bit10(self):
+        """REGRESSION (Vincent): bit10 set but position far from target keeps waiting.
 
-        The removed delta<=250 heuristic returned True here.
+        bit10 is stale-1 throughout here; completion is only reported once the
+        actual position is within the window of the target.
         """
         from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
 
         od = MagicMock()
-        od.read_u16 = AsyncMock(return_value=_SW_TARGET_REACHED)  # stale bit10, no bit12
-        od.read_i32 = AsyncMock(side_effect=[5000, 5000])         # positions match (old trap)
-
-        cfg = ProfilePositionConfig(poll_interval_s=0.0)
+        od.read_u16 = AsyncMock(return_value=_SW_TARGET_REACHED)   # bit10=1 (stale) the whole time
+        od.read_i32 = AsyncMock(side_effect=[100, 2500, 5000])     # position: far, far, AT target
+        cfg = ProfilePositionConfig(poll_interval_s=0.0, position_reached_window=100)
         pp = ProfilePosition(od, config=cfg)
-        with pytest.raises(TimeoutError, match="set-point not acknowledged"):
-            await pp._wait_setpoint_ack(timeout_s=0.05)
+        await pp.wait_target_reached(target_position=5000, timeout_s=5.0)
+        assert od.read_i32.call_count == 3, "must wait until position reaches target"
 
     @pytest.mark.asyncio
-    async def test_wait_target_reached_returns_immediately_when_no_motion(self):
-        """motion_started=False (target==current) returns without any read."""
+    async def test_wait_target_reached_times_out_if_position_never_reaches(self):
+        """REGRESSION (Vincent): stale bit10 + position never near target => TimeoutError."""
+        from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
+
+        od = MagicMock()
+        od.read_u16 = AsyncMock(return_value=_SW_ACK_STALE)   # bit12=1 AND bit10=1 (0x1627-class)
+        od.read_i32 = AsyncMock(return_value=100003)          # far from target, never moves
+        cfg = ProfilePositionConfig(poll_interval_s=0.0, position_reached_window=100)
+        pp = ProfilePosition(od, config=cfg)
+        with pytest.raises(TimeoutError, match="Timeout waiting for target reached"):
+            await pp.wait_target_reached(target_position=5000, timeout_s=0.05)
+
+    @pytest.mark.asyncio
+    async def test_wait_target_reached_completes_when_position_at_target(self):
+        """bit10 set AND position within window => reached."""
         from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
 
         od = MagicMock()
         od.read_u16 = AsyncMock(return_value=_SW_TARGET_REACHED)
-
-        pp = ProfilePosition(od, config=ProfilePositionConfig())
-        await pp.wait_target_reached(timeout_s=5.0, motion_started=False)
-        assert od.read_u16.call_count == 0, "no-motion path must not poll the statusword"
-
-    @pytest.mark.asyncio
-    async def test_wait_target_reached_waits_for_bit10_when_moving(self):
-        """motion_started=True waits for bit10=1 (real rising edge)."""
-        from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
-
-        od = MagicMock()
-        od.read_u16 = AsyncMock(side_effect=[_SW_OE_REMOTE, _SW_OE_REMOTE, _SW_TARGET_REACHED])
-
-        cfg = ProfilePositionConfig(poll_interval_s=0.0)
+        od.read_i32 = AsyncMock(return_value=5005)            # within window(100) of 5000
+        cfg = ProfilePositionConfig(poll_interval_s=0.0, position_reached_window=100)
         pp = ProfilePosition(od, config=cfg)
-        await pp.wait_target_reached(timeout_s=5.0, motion_started=True)
-        assert od.read_u16.call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_wait_target_reached_default_returns_on_bit10(self):
-        """Default (motion_started=True) returns immediately when bit10=1."""
-        from dryve_d1.motion.profile_position import ProfilePosition, ProfilePositionConfig
-
-        od = MagicMock()
-        od.read_u16 = AsyncMock(return_value=_SW_TARGET_REACHED)  # bit10=1
-
-        pp = ProfilePosition(od, config=ProfilePositionConfig())
-        await pp.wait_target_reached(timeout_s=5.0)
-        assert od.read_u16.call_count == 1
+        await pp.wait_target_reached(target_position=5000, timeout_s=5.0)
 
     @pytest.mark.asyncio
     async def test_wait_target_reached_abort(self):
@@ -721,13 +704,11 @@ class TestStaleTargetReachedPrevention:
         abort_event = asyncio.Event()
         od = MagicMock()
         od.read_u16 = AsyncMock(return_value=_SW_OE_REMOTE)  # moving forever
-
         cfg = ProfilePositionConfig(poll_interval_s=0.01)
         pp = ProfilePosition(od, config=cfg, abort_event=abort_event)
         abort_event.set()
-
         with pytest.raises(MotionAborted):
-            await pp.wait_target_reached(timeout_s=30.0, motion_started=True)
+            await pp.wait_target_reached(target_position=5000, timeout_s=30.0)
 
 
 # ---------------------------------------------------------------------------

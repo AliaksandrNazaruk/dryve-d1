@@ -98,9 +98,10 @@ async def test_move_to_pulses_new_setpoint_set_then_clear() -> None:
         statuswords=[
             0,                   # barrier read before start
             0,                   # ack read: bit10 == 0 -> set-point acknowledged (moving)
-            SW_TARGET_REACHED,   # wait_target_reached: done
+            SW_TARGET_REACHED,   # wait_target_reached: bit10 set
         ]
     )
+    od.read_i32_value = 12345    # actual position == target -> completion confirmed
     pp = ProfilePosition(od, config=_fast_cfg())
 
     await pp.move_to(target_position=12345, timeout_s=0.5)
@@ -126,10 +127,11 @@ async def test_move_to_holds_bit4_until_setpoint_acknowledged() -> None:
         statuswords=[
             0,                   # barrier read
             SW_TARGET_REACHED,   # ack read #1: still bit10=1, no bit12 -> not yet acked
-            SW_SETPOINT_ACK,     # ack read #2: bit12 set -> acknowledged (bit10 cleared)
-            SW_TARGET_REACHED,   # wait_target_reached: done
+            SW_SETPOINT_ACK,     # ack read #2: bit12 set -> acknowledged
+            SW_TARGET_REACHED,   # wait_target_reached: bit10 set
         ]
     )
+    od.read_i32_value = 999      # actual position == target -> completion confirmed
     pp = ProfilePosition(od, config=_fast_cfg())
 
     await pp.move_to(target_position=999)
@@ -168,21 +170,35 @@ async def test_move_to_raises_when_setpoint_never_acknowledged() -> None:
     assert not _bit(cw_writes[-1], int(CWBit.NEW_SET_POINT)), "bit4 must be released on ack timeout"
 
 
-async def test_move_to_completes_without_motion_when_already_at_target() -> None:
-    """Ack via bit12 while bit10 stays set => target == current position.
+async def test_move_to_completes_when_position_at_target() -> None:
+    """Ack via bit12 while bit10 stays set AND the axis is already at target.
 
-    The drive reports the set-point applied with Target Reached still set, so the
-    move completes immediately with no wait — and no false timeout.
+    The drive acknowledges (bit12) with Target Reached still set; since the
+    actual position already equals the target, the move completes with no wait
+    and no false timeout.
     """
-    od = _FakeOD(
-        statuswords=[
-            0,                                     # barrier read
-            SW_SETPOINT_ACK | SW_TARGET_REACHED,   # ack: bit12 set AND bit10 set -> no motion
-        ]
-    )
+    od = _FakeOD(const_statusword=SW_SETPOINT_ACK | SW_TARGET_REACHED)
+    od.read_i32_value = 42  # actual position already == target
     pp = ProfilePosition(od, config=_fast_cfg())
 
     await pp.move_to(target_position=42)
 
     cw_writes = [w[1] for w in od.writes_u16 if w[0] == int(ODIndex.CONTROLWORD)]
     assert not _bit(cw_writes[-1], int(CWBit.NEW_SET_POINT)), "bit4 must be released after ack"
+
+
+async def test_move_to_does_not_falsely_complete_on_stale_bit10() -> None:
+    """REGRESSION (field): bit12 ack with a STALE bit10 must not fake completion.
+
+    Real dryve hardware sets bit12 (Set-point Acknowledge) while bit10 "Target
+    Reached" is still 1 from the previous motion — even for a genuine move
+    (statusword 0x1627). Completion must be confirmed against the actual
+    position, not the bits. Here the fake position never reaches the target, so
+    move_to must TIME OUT rather than report "reached" instantly.
+    """
+    od = _FakeOD(const_statusword=SW_SETPOINT_ACK | SW_TARGET_REACHED)  # 0x1627-like
+    od.read_i32_value = 100003  # far from target 5000 (Vincent's X axis)
+    pp = ProfilePosition(od, config=_fast_cfg(move_timeout_s=0.05))
+
+    with pytest.raises(TimeoutError):
+        await pp.move_to(target_position=5000)

@@ -32,6 +32,7 @@ class ProfilePositionConfig:
     move_timeout_s: float = 30.0
     system_cycle_delay_s: float = 0.01  # Explicit system cycle delay (default 10ms, typical drive cycle: 1-5ms)
     setpoint_ack_timeout_s: float = 1.0  # Max wait for the drive to acknowledge a new set-point (bit12/bit10)
+    position_reached_window: int = 100  # |actual-target| tolerance that confirms bit10 "target reached" (rejects stale bit10)
 
     verify_mode: bool = False
     mode_set_timeout_s: float = 1.0
@@ -152,29 +153,25 @@ class ProfilePosition:
 
         # ── Closed-loop Start handshake (manual §5.6.10.2) ──────────────────
         # 1. Set bit4 "New Set-point" and HOLD it high.
-        # 2. The drive resets bit10 "Target Reached" and sets bit12
-        #    "Set-point Acknowledge" to confirm it captured the set-point.
-        # 3. ONLY after that acknowledge do we reset bit4.
-        # 4. The drive then clears bit12 automatically; bit10 rises again once
-        #    the movement completes.
-        # Holding bit4 until the acknowledge latches bit12, which removes the
-        # race the old open-loop pulse + position-delta heuristic tried (and
-        # failed) to paper over: a wrong-mode/rejected Start now yields no
-        # acknowledge and a loud TimeoutError instead of a false "reached".
+        # 2. The drive confirms it captured the set-point by setting bit12
+        #    "Set-point Acknowledge" (and eventually clearing bit10). We wait
+        #    for that acknowledge before releasing bit4 — a wrong-mode/rejected
+        #    Start yields no acknowledge and a loud TimeoutError.
+        # 3. Release bit4; the drive clears bit12 and runs the move.
+        # NOTE: bit10 "Target Reached" is STALE right after the set-point — real
+        # hardware sets bit12 while bit10 is still 1 from the previous motion,
+        # even for a genuine move. So completion is NOT inferred from the bits
+        # alone (that caused a false "no motion required"); wait_target_reached
+        # confirms bit10 against the actual position.
         await self._od.write_u16(int(ODIndex.CONTROLWORD), int(set_word) & 0xFFFF, 0)
         try:
-            motion_started = await self._wait_setpoint_ack(
-                timeout_s=self._cfg.setpoint_ack_timeout_s
-            )
+            await self._wait_setpoint_ack(timeout_s=self._cfg.setpoint_ack_timeout_s)
         finally:
             # Always release bit4, even if the acknowledge timed out, so the
             # drive is not left latched waiting on a stale Start signal.
             await self._od.write_u16(int(ODIndex.CONTROLWORD), int(clear_word) & 0xFFFF, 0)
 
-        # motion_started is True when bit10 was observed to clear (the drive is
-        # actually moving); False when the set-point was acknowledged with bit10
-        # still set (target equals current position — nothing to wait for).
-        await self.wait_target_reached(timeout_s=timeout_s, motion_started=motion_started)
+        await self.wait_target_reached(target_position=target_position, timeout_s=timeout_s)
 
     async def move_to_position(
         self,
@@ -239,30 +236,22 @@ class ProfilePosition:
         """
         await self.halt(enabled=True)
 
-    async def _wait_setpoint_ack(self, *, timeout_s: float) -> bool:
+    async def _wait_setpoint_ack(self, *, timeout_s: float) -> None:
         """Wait for the drive to acknowledge the new set-point (manual §5.6.10.2).
 
         Called while Controlword bit4 "New Set-point" is held HIGH. Per the
-        manual, after Start the drive resets Statusword bit10 "Target Reached"
-        and sets bit12 "Set-point Acknowledge" ("Setpoint applied"). Either
-        transition confirms the set-point was accepted. Because bit4 is held
-        high, the drive keeps bit12 set until we release bit4, so this poll
-        cannot miss a fast move — no position-delta heuristic is needed.
+        manual, after Start the drive sets Statusword bit12 "Set-point
+        Acknowledge" and (eventually) resets bit10 "Target Reached". Either
+        confirms the set-point was *accepted* — but NOT that it is complete:
+        real hardware sets bit12 while bit10 is still 1 (stale from the previous
+        motion) for a genuine move. So this only gates the bit4 release; actual
+        completion is decided later by wait_target_reached() against position.
 
-        Neither signal is stale-able from a previous motion: in PP idle bit12==0
-        ("wait for new setpoint") and bit10==1, so we wait for bit12 to rise OR
-        bit10 to fall. A leftover bit10==1 from homing therefore cannot produce
-        a false positive — exactly the failure the old delta<=250 heuristic
-        caused.
-
-        Returns:
-            True  if bit10 was observed cleared (the drive is moving).
-            False if the set-point was acknowledged via bit12 while bit10 was
-                  still set (target == current position — no motion required).
+        A set-point that is never acknowledged (e.g. wrong mode / rejected
+        Start) raises TimeoutError rather than silently proceeding.
 
         Raises:
-            TimeoutError: set-point never acknowledged (Start not accepted —
-                e.g. the drive is not actually in PP mode).
+            TimeoutError: set-point never acknowledged.
             RuntimeError: drive entered FAULT while waiting.
         """
         deadline = monotonic_s() + timeout_s
@@ -271,12 +260,12 @@ class ProfilePosition:
             target_reached = _bit(sw, int(SWBit.TARGET_REACHED))
             setpoint_ack = _bit(sw, int(SWBit.OP_MODE_SPECIFIC))
 
-            if not target_reached:
-                _LOGGER.debug("PP: set-point acknowledged — bit10 cleared (moving)")
-                return True
-            if setpoint_ack:
-                _LOGGER.debug("PP: set-point acknowledged — bit12 set, bit10 still set (no motion)")
-                return False
+            if setpoint_ack or not target_reached:
+                _LOGGER.debug(
+                    "PP: set-point acknowledged (bit12=%s, bit10=%s)",
+                    setpoint_ack, target_reached,
+                )
+                return
 
             if _bit(sw, int(SWBit.FAULT)):
                 decoded = decode_statusword(sw)
@@ -297,25 +286,30 @@ class ProfilePosition:
                 )
             await asyncio.sleep(self._cfg.poll_interval_s)
 
-    async def wait_target_reached(self, *, timeout_s: float | None = None,
-                                  motion_started: bool = True) -> None:
+    async def wait_target_reached(self, *, target_position: int | None = None,
+                                  timeout_s: float | None = None) -> None:
+        """Wait until the move physically completes.
+
+        Completion = Statusword bit10 "Target Reached" set AND the actual
+        position within ``position_reached_window`` of ``target_position``.
+
+        The position cross-check is essential: right after a new set-point the
+        dryve D1 leaves bit10 STALE at 1 (from the previous motion) for several
+        cycles, even for a genuine move. Trusting bit10 alone there reports a
+        phantom "reached" without the axis moving. Anchoring bit10 to the actual
+        position against the *new* target rejects that stale window — and, when
+        ``target_position`` is omitted (or no window is configured), this falls
+        back to the bare bit10 check.
+        """
         timeout = self._cfg.move_timeout_s if timeout_s is None else float(timeout_s)
         deadline = monotonic_s() + timeout
+        window = int(self._cfg.position_reached_window)
 
         async def _read_mode_display_safe() -> int | None:
             try:
                 return await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
             except Exception:
                 return None
-
-        # The set-point was already acknowledged by the closed-loop handshake in
-        # move_to(). If the acknowledge came with bit10 still set (motion_started
-        # is False), the drive reports the target equals the current position
-        # (manual: bit10 and bit12 set together when no move is needed) — there
-        # is nothing to wait for.
-        if not motion_started:
-            _LOGGER.info("PP: target reached (no motion required)")
-            return
 
         while True:
             # ── Abort check (highest priority) ──────────────────────
@@ -325,9 +319,15 @@ class ProfilePosition:
             loop_time = monotonic_s()
             sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
             if _bit(sw, int(SWBit.TARGET_REACHED)):
-                _LOGGER.info("PP: target reached")
-                return
-            
+                if target_position is None or window <= 0:
+                    _LOGGER.info("PP: target reached")
+                    return
+                actual_pos = await self._od.read_i32(int(ODIndex.POSITION_ACTUAL_VALUE), 0)
+                if abs(actual_pos - int(target_position)) <= window:
+                    _LOGGER.info("PP: target reached (pos=%d, target=%d)", actual_pos, int(target_position))
+                    return
+                # bit10 set but position far from target → stale bit10; keep waiting.
+
             # Check for fault condition
             if _bit(sw, int(SWBit.FAULT)):
                 decoded = decode_statusword(sw)
@@ -335,7 +335,7 @@ class ProfilePosition:
                     f"Fault detected while waiting for target reached. "
                     f"statusword=0x{int(sw) & 0xFFFF:04X}, flags={decoded}"
                 )
-            
+
             if loop_time >= deadline:
                 # Provide more diagnostic information on timeout
                 decoded = decode_statusword(sw)
