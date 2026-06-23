@@ -53,6 +53,30 @@ class ProfilePosition:
         self._od = od
         self._cfg = config or ProfilePositionConfig()
         self._abort: asyncio.Event | None = abort_event
+        # Drive's own Position Window (0x6067), discovered at connect. Used to
+        # size the completion tolerance so we never demand a TIGHTER window than
+        # the drive itself (which would false-timeout a move the drive already
+        # considers reached). None until set; falls back to config default.
+        self._drive_position_window: int | None = None
+
+    def set_drive_position_window(self, window: int | None) -> None:
+        """Record the drive's Position Window (0x6067), read once at connect."""
+        try:
+            w = int(window) if window is not None else 0
+        except (TypeError, ValueError):
+            w = 0
+        self._drive_position_window = w if w > 0 else None
+
+    def _reached_window(self) -> int:
+        """Completion tolerance: max(drive's 0x6067, config default).
+
+        Never tighter than the drive's own Position Window — bit10 is the gate,
+        so a looser tolerance is safe, but a tighter one false-timeouts.
+        """
+        cfg_window = int(self._cfg.position_reached_window)
+        if self._drive_position_window:
+            return max(cfg_window, self._drive_position_window)
+        return cfg_window
 
     async def ensure_mode(self) -> None:
         # Manual §5.6.10: the operation mode is only guaranteed active once
@@ -315,7 +339,7 @@ class ProfilePosition:
         """
         timeout = self._cfg.move_timeout_s if timeout_s is None else float(timeout_s)
         deadline = monotonic_s() + timeout
-        window = int(self._cfg.position_reached_window)
+        window = self._reached_window()
 
         async def _read_mode_display_safe() -> int | None:
             try:
@@ -355,6 +379,16 @@ class ProfilePosition:
                 actual_pos = await self._od.read_i32(int(ODIndex.POSITION_ACTUAL_VALUE), 0)
                 mode_display = await _read_mode_display_safe()
                 position_error = abs(actual_pos - target_pos)
+                # If the drive reported Target Reached the whole time yet the
+                # axis never approached the target, the most likely cause is a
+                # drive-side config issue, not the command — surface a hint.
+                hint = ""
+                if decoded.get("target_reached", False) and position_error > window:
+                    hint = (
+                        " — drive reports Target Reached but the axis did not move; "
+                        "check the drive's Position Window (0x6067) and that the "
+                        "motor is powered/enabled."
+                    )
                 raise TimeoutError(
                     f"Timeout waiting for target reached after {timeout:.1f}s. "
                     f"statusword=0x{int(sw) & 0xFFFF:04X}, "
@@ -362,6 +396,6 @@ class ProfilePosition:
                     f"target_reached={decoded.get('target_reached', False)}, "
                     f"op_mode_specific={decoded.get('op_mode_specific', False)}, "
                     f"target_position={target_pos}, actual_position={actual_pos}, "
-                    f"position_error={position_error}"
+                    f"position_error={position_error}, reached_window={window}{hint}"
                 )
             await asyncio.sleep(self._cfg.poll_interval_s)

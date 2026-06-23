@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a phantom "reached" without moving. `wait_target_reached()` now requires
     bit 10 set **and** the actual position within `position_reached_window`
     (default 100) of the target.
+  - The completion tolerance is sized from the drive's own **Position Window
+    `0x6067`** (read at connect): `max(0x6067, position_reached_window)`. This
+    prevents a *false timeout* on a drive whose configured window is larger than
+    the default. `0x6067` is also logged at connect, with a warning when it is
+    implausibly large relative to the stroke (a drive so configured reports
+    "Target Reached" without moving — manual p.172). The move timeout message
+    hints at `0x6067` when the drive flags Target Reached but never moves.
 - **Position Range Limit addressing**: `set_position_limits()` /
   `get_position_limits()` now use object `0x607B` sub-index 1 (min) and 2 (max),
   per the dryve D1 manual (p.174). The drive has no `0x607D` object; the old

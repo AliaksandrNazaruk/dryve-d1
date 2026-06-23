@@ -44,6 +44,7 @@ class _FakeOD:
         self.writes_u32: list[tuple[int, int, int]] = []
         self.writes_i32: list[tuple[int, int, int]] = []
         self.read_i32_value = 0
+        self.target_position_value: int | None = None  # distinct 0x607A read if set
         # Ordered event log: ("read_sw",) and ("write_cw", value) for handshake
         # ordering assertions.
         self.events: list[tuple] = []
@@ -61,6 +62,8 @@ class _FakeOD:
         return 1
 
     async def read_i32(self, index: int, subindex: int = 0) -> int:
+        if index == int(ODIndex.TARGET_POSITION) and self.target_position_value is not None:
+            return int(self.target_position_value)
         return int(self.read_i32_value)
 
     async def write_u16(self, index: int, value: int, subindex: int = 0) -> None:
@@ -230,3 +233,43 @@ async def test_move_to_does_not_falsely_complete_on_stale_bit10() -> None:
 
     with pytest.raises(TimeoutError):
         await pp.move_to(target_position=5000)
+
+
+def test_reached_window_uses_drive_window_when_larger() -> None:
+    pp = ProfilePosition(_FakeOD(), config=_fast_cfg(position_reached_window=100))
+    pp.set_drive_position_window(300)
+    assert pp._reached_window() == 300, "must not demand tighter than the drive's 0x6067"
+
+
+def test_reached_window_falls_back_to_default() -> None:
+    pp = ProfilePosition(_FakeOD(), config=_fast_cfg(position_reached_window=100))
+    pp.set_drive_position_window(50)   # smaller than default -> default wins
+    assert pp._reached_window() == 100
+    for bad in (0, None):
+        pp.set_drive_position_window(bad)
+        assert pp._reached_window() == 100
+
+
+async def test_wait_target_reached_honors_large_drive_window() -> None:
+    """REGRESSION: a drive whose 0x6067 > our default must not false-timeout.
+
+    Axis settles 200 short of target — inside the drive window (300) but outside
+    the config default (100). With bit10 set, this must COMPLETE, not time out.
+    """
+    od = _FakeOD(const_statusword=SW_TARGET_REACHED)
+    od.read_i32_value = 4800  # |4800 - 5000| = 200
+    pp = ProfilePosition(od, config=_fast_cfg(position_reached_window=100))
+    pp.set_drive_position_window(300)
+
+    await pp.wait_target_reached(target_position=5000, timeout_s=0.2)  # must not raise
+
+
+async def test_timeout_error_hints_at_position_window() -> None:
+    """Timeout with bit10 stuck + axis never near target points at 0x6067."""
+    od = _FakeOD(const_statusword=SW_TARGET_REACHED)  # bit10=1 the whole time
+    od.read_i32_value = 100003        # actual: never near target
+    od.target_position_value = 500    # 0x607A reads 500 -> position_error is large
+    pp = ProfilePosition(od, config=_fast_cfg(position_reached_window=100, move_timeout_s=0.03))
+
+    with pytest.raises(TimeoutError, match="Position Window"):
+        await pp.wait_target_reached(target_position=500, timeout_s=0.03)

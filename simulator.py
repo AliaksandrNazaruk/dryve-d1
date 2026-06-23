@@ -64,11 +64,12 @@ OBJECT_SIZES = {
     0x6084: 4,  # Profile deceleration (often used by clients)
     0x60FF: 4,  # Target velocity
     0x6098: 1,  # Homing method (client may write 0x23 etc.)
+    0x6067: 4,  # Position Window (symmetric tolerance for "Target Reached")
     0x607B: 4,  # Position Range Limit (ARRAY): sub1=min, sub2=max (dryve has no 0x607D)
     0x2014: 2,  # custom diag/status code (legacy: 1 OK, 0x23 homing running)
 }
 
-SIGNED_32 = {0x6064, 0x606C, 0x607A, 0x6081, 0x6083, 0x6084, 0x60FF, 0x607B}
+SIGNED_32 = {0x6064, 0x606C, 0x607A, 0x6081, 0x6083, 0x6084, 0x60FF, 0x607B, 0x6067}
 SIGNED_8 = {0x6060, 0x6061}
 
 # DS402 statusword bits (minimal set)
@@ -181,6 +182,7 @@ class FakeDriveState:
         # Soft limits (used by your driver)
         self.soft_limit_min: int = 0
         self.soft_limit_max: int = 120000
+        self.position_window: int = 50  # 0x6067 — small, like a real well-configured drive
 
         # Emergency
         self.emergency_active: bool = False
@@ -590,6 +592,8 @@ class FakeDriveState:
                 return struct.pack("<i", int(self.target_velocity))
             if idx == 0x6098:
                 return struct.pack("<B", int(self.homing_method) & 0xFF)
+            if idx == 0x6067:
+                return struct.pack("<i", int(self.position_window))
             if idx == 0x607B:
                 # Position Range Limit ARRAY (dryve manual p.174):
                 # sub0=number of entries, sub1=min, sub2=max.

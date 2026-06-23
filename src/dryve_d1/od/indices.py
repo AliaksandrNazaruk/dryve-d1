@@ -22,6 +22,7 @@ class ODIndex(IntEnum):
     MODES_OF_OPERATION_DISPLAY = 0x6061
 
     POSITION_ACTUAL_VALUE = 0x6064
+    POSITION_WINDOW = 0x6067  # symmetric window around target; bit10 "Target Reached" set inside it (manual p.172)
     VELOCITY_ACTUAL_VALUE = 0x606C  # actual velocity (often signed)
 
     TARGET_POSITION = 0x607A
