@@ -21,7 +21,7 @@ from .controlword import (
     cw_switch_on,
     cw_with_bit,
 )
-from .indices import ODIndex
+from .indices import ODIndex, ObjectDictionary
 from .statusword import (
     CiA402State,
     SWBit,
@@ -33,6 +33,7 @@ from .types import INT8, INT16, INT32, UINT8, UINT16, UINT32, ODType
 __all__ = [
     # indices
     "ODIndex",
+    "ObjectDictionary",
     # types
     "ODType",
     "INT8",

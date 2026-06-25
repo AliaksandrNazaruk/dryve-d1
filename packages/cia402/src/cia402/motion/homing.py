@@ -4,6 +4,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+from dryve_d1.od.indices import ObjectDictionary
+
 from ..cia402.bits import bit_is_set as _bit
 from ..od.controlword import cw_enable_operation, cw_pulse_new_set_point
 from ..od.indices import ODIndex
@@ -54,19 +56,19 @@ class HomingResult:
 class Homing:
     """Homing mode helper (6060=6)."""
 
-    def __init__(self, od: AsyncODAccessor, *, config: HomingConfig | None = None,
+    def __init__(self, accessor: AsyncODAccessor, *, config: HomingConfig | None = None,
                  abort_event: asyncio.Event | None = None) -> None:
-        self._od = od
+        self._od = ObjectDictionary(accessor)
         self._cfg = config or HomingConfig()
         self._abort: asyncio.Event | None = abort_event
 
     async def ensure_mode(self) -> None:
-        await self._od.write_u8(int(ODIndex.MODES_OF_OPERATION), MODE_HOMING, 0)
+        await self._od.MODES_OF_OPERATION.write(MODE_HOMING)
         if not self._cfg.verify_mode:
             return
         deadline = monotonic_s() + float(self._cfg.mode_set_timeout_s)
         while True:
-            mode_disp = await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+            mode_disp = await self._od.MODES_OF_OPERATION_DISPLAY.read()
             if mode_disp == MODE_HOMING:
                 return
             if monotonic_s() >= deadline:
@@ -82,22 +84,22 @@ class Homing:
         # 0x6098 Homing method: read-only on CiA 402 drive (must be configured via CPG web UI).
         # On drives where it is writable, set skip_method_write=False in HomingConfig.
         if not self._cfg.skip_method_write:
-            await self._od.write_u8(int(ODIndex.HOMING_METHOD), int(m) & 0xFF, 0)
+            await self._od.HOMING_METHOD.write(int(m) & 0xFF)
 
         if s1 is not None:
-            await self._od.write_u32(int(ODIndex.HOMING_SPEEDS), int(s1), 1)
+            await self._od.HOMING_SPEED_MIN.write(int(s1))
         if s2 is not None:
-            await self._od.write_u32(int(ODIndex.HOMING_SPEEDS), int(s2), 2)
+            await self._od.HOMING_SPEED_MAX.write(int(s2))
         if acc is not None:
-            await self._od.write_u32(int(ODIndex.HOMING_ACCELERATION), int(acc), 0)
+            await self._od.HOMING_ACCELERATION.write(int(acc))
 
     async def start(self) -> None:
         """Start homing (pulse NEW_SET_POINT bit in Controlword).
-        
+
         Per manual: start command via bit4 should not be set until required objects
         are configured, and it's recommended to schedule one cycle send/receive as
         a delay before setting start to ensure reliable data adoption.
-        
+
         We ensure this by reading statusword after configuration and before start.
         """
         # Barrier cycle: per manual, wait one system cycle after configuration before start
@@ -105,17 +107,17 @@ class Homing:
         # before sending Start Command via Controlword bit 4.
         # We ensure this by: (1) reading statusword as a round-trip barrier to ensure
         # the drive has processed parameter changes, (2) adding explicit system cycle delay.
-        await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+        await self._od.STATUSWORD.read()
         # Explicit system cycle delay (typical drive cycle: 1-5ms, use configurable delay)
         await asyncio.sleep(self._cfg.system_cycle_delay_s)
-        
+
         # Per manual: after Operation Enabled, bits 0..3 must always be sent
         # Start with base containing hold bits (0x000F)
         base = cw_enable_operation()  # 0x000F = bits 0,1,2,3 set
         # Pulse new_setpoint while preserving hold bits (0..3)
         set_word, clear_word = cw_pulse_new_set_point(base)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(set_word) & 0xFFFF, 0)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(clear_word) & 0xFFFF, 0)
+        await self._od.CONTROLWORD.write(int(set_word) & 0xFFFF)
+        await self._od.CONTROLWORD.write(int(clear_word) & 0xFFFF)
         _LOGGER.info("Homing: start command issued")
 
     async def run(self, *, timeout_s: float | None = None) -> HomingResult:
@@ -144,7 +146,7 @@ class Homing:
             if self._abort is not None and self._abort.is_set():
                 raise MotionAborted("Homing aborted by stop command")
 
-            sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+            sw = await self._od.STATUSWORD.read()
             # For homing, we interpret bit 12 as "homing attained" (op mode specific)
             attained = _bit(sw, 12)
             # DS402 commonly uses bit 13 as "homing error" (even if our SWBit labels it differently)

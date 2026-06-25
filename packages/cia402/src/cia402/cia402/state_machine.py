@@ -11,6 +11,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from dryve_d1.od.indices import ObjectDictionary
+
 _LOGGER = logging.getLogger(__name__)
 
 from ..od.controlword import (
@@ -69,12 +71,13 @@ class CiA402StateMachine:
 
     def __init__(
         self,
-        od: AsyncODAccessor,
+        accessors: AsyncODAccessor,
         *,
         config: StateMachineConfig | None = None,
         hooks: DeviceHooks | None = None,
     ) -> None:
-        self._od = od
+        self._accessor = accessors
+        self._od = ObjectDictionary(accessors)
         self._cfg = config or StateMachineConfig()
         if hooks is None:
             from ..plugin import NullDeviceHooks
@@ -82,7 +85,7 @@ class CiA402StateMachine:
         self._hooks = hooks
 
     async def read_statusword(self) -> int:
-        sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+        sw = await self._od.STATUSWORD.read()
         sw_u16 = int(sw) & _U16_MASK
         self._hooks.validate_statusword(sw_u16)
         if self._cfg.require_remote:
@@ -90,7 +93,7 @@ class CiA402StateMachine:
         return sw_u16
 
     async def write_controlword(self, value: int) -> None:
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(value) & _U16_MASK, 0)
+        await self._od.CONTROLWORD.write(int(value) & _U16_MASK)
 
     async def current_state(self) -> CiA402State:
         sw = await self.read_statusword()

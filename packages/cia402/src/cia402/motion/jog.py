@@ -240,7 +240,7 @@ class JogController:
     async def _ensure_ready_for_motion(self) -> None:
         if not self._cfg.require_operation_enabled:
             return
-        sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+        sw = self._od.STATUSWORD.read()
         flags = decode_statusword(sw)
         if not flags.get("operation_enabled", False):
             raise RuntimeError(f"Drive not in Operation Enabled; statusword=0x{int(sw) & 0xFFFF:04X}")

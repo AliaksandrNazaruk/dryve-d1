@@ -39,15 +39,21 @@ class _FakeOD:
         # only const_statusword is provided) every read returns const_statusword.
         self.statuswords = list(statuswords or [])
         self.const_statusword = const_statusword
-        self.writes_u8: list[tuple[int, int, int]] = []
+        self.writes_i8:  list[tuple[int, int, int]] = []
+        self.writes_u8:  list[tuple[int, int, int]] = []
+        self.writes_i16: list[tuple[int, int, int]] = []
         self.writes_u16: list[tuple[int, int, int]] = []
         self.writes_u32: list[tuple[int, int, int]] = []
         self.writes_i32: list[tuple[int, int, int]] = []
+
         self.read_i32_value = 0
         self.target_position_value: int | None = None  # distinct 0x607A read if set
         # Ordered event log: ("read_sw",) and ("write_cw", value) for handshake
         # ordering assertions.
         self.events: list[tuple] = []
+
+    async def read_i16(self, index: int, subindex: int = 0) -> int:
+        return await self.read_u16(index, subindex)
 
     async def read_u16(self, index: int, subindex: int = 0) -> int:
         if index == int(ODIndex.STATUSWORD):
@@ -61,15 +67,27 @@ class _FakeOD:
     async def read_i8(self, index: int, subindex: int = 0) -> int:
         return 1
 
+    async def read_u8(self, index: int, subindex: int = 0) -> int:
+        return await self.read_i8(index, subindex)
+
     async def read_i32(self, index: int, subindex: int = 0) -> int:
         if index == int(ODIndex.TARGET_POSITION) and self.target_position_value is not None:
             return int(self.target_position_value)
         return int(self.read_i32_value)
 
+    async def read_u32(self, index: int, subindex: int = 0) -> int:
+        return await self.read_i8(index, subindex)
+
+    async def write_i16(self, index: int, value: int, subindex: int = 0) -> None:
+        self.writes_i16.append((index, value, subindex))
+
     async def write_u16(self, index: int, value: int, subindex: int = 0) -> None:
         if index == int(ODIndex.CONTROLWORD):
             self.events.append(("write_cw", value))
         self.writes_u16.append((index, value, subindex))
+
+    async def write_i8(self, index: int, value: int, subindex: int = 0) -> None:
+        self.writes_i8.append((index, value, subindex))
 
     async def write_u8(self, index: int, value: int, subindex: int = 0) -> None:
         self.writes_u8.append((index, value, subindex))

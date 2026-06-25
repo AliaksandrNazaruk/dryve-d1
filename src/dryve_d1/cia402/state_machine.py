@@ -26,7 +26,7 @@ from ..od.controlword import (
     cw_shutdown,
     cw_switch_on,
 )
-from ..od.indices import ODIndex
+from ..od.indices import ODIndex, ObjectDictionary
 from ..od.statusword import CiA402State, SWBit, infer_cia402_state
 from ..protocol.accessor import AsyncODAccessor
 from ..transport.clock import monotonic_s
@@ -70,12 +70,14 @@ def _ensure_hold_bits(controlword: int) -> int:
 class CiA402StateMachine:
     """Async CiA 402 state machine runner for dryve D1."""
 
-    def __init__(self, od: AsyncODAccessor, *, config: StateMachineConfig | None = None) -> None:
-        self._od = od
+    def __init__(self, accessor: AsyncODAccessor, *, config: StateMachineConfig | None = None) -> None:
+        self._accessor = accessor
+        self._od = ObjectDictionary(accessor)
+
         self._cfg = config or StateMachineConfig()
 
     async def read_statusword(self) -> int:
-        sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+        sw = await self._od.STATUSWORD.read()
         sw_u16 = int(sw) & _U16_MASK
         if sw_u16 == _INVALID_BOOT_STATE:
             raise InvalidBootStateError(
@@ -87,7 +89,7 @@ class CiA402StateMachine:
         return sw_u16
 
     async def write_controlword(self, value: int) -> None:
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(value) & _U16_MASK, 0)
+        await self._od.CONTROLWORD.write(int(value) & _U16_MASK)
 
     async def current_state(self) -> CiA402State:
         sw = await self.read_statusword()
@@ -145,11 +147,11 @@ class CiA402StateMachine:
 
     async def fault_reset(self) -> None:
         """Reset fault according to contract.
-        
+
         Preconditions:
         - Statusword bit 9 (REMOTE) = 1 (required for dryve D1)
         - Current state = FAULT or FAULT_REACTION_ACTIVE
-        
+
         Postconditions:
         - If fault was present: final state ∈ {SWITCH_ON_DISABLED, READY_TO_SWITCH_ON}
         - If no fault: state unchanged (method returns without effect)
@@ -163,7 +165,7 @@ class CiA402StateMachine:
         # Check REMOTE bit (bit 9) - required for dryve D1
         if not bit_is_set(sw, SWBit.REMOTE):
             raise StateMachineError("REMOTE bit (bit 9) must be enabled for fault reset to work")
-        
+
         await self.write_controlword(cw_fault_reset())
         # Many drives require a pulse; send reset then clear it (safe baseline: shutdown).
         # Per contract: fault reset pulse should be at least 100ms
