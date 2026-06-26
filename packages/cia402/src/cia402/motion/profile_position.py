@@ -4,6 +4,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+from dryve_d1.od.indices import ObjectDictionary
+
 from ..cia402.bits import bit_is_set as _bit
 from ..od.controlword import (
     CWBit,
@@ -46,9 +48,9 @@ MODE_PROFILE_POSITION = 1
 class ProfilePosition:
     """Profile Position mode helper (6060=1)."""
 
-    def __init__(self, od: AsyncODAccessor, *, config: ProfilePositionConfig | None = None,
+    def __init__(self, accessors: AsyncODAccessor, *, config: ProfilePositionConfig | None = None,
                  abort_event: asyncio.Event | None = None) -> None:
-        self._od = od
+        self._od = ObjectDictionary(accessors)
         self._cfg = config or ProfilePositionConfig()
         self._abort: asyncio.Event | None = abort_event
 
@@ -56,13 +58,13 @@ class ProfilePosition:
         # Always write mode register and wait for settle — do NOT try to read
         # 0x6061 first, because the CiA 402 drive gateway can return stale values
         # (documented issue, same approach as PV mode's ensure_mode).
-        await self._od.write_u8(int(ODIndex.MODES_OF_OPERATION), MODE_PROFILE_POSITION, 0)
+        await self._od.MODES_OF_OPERATION.write(MODE_PROFILE_POSITION)
         if not self._cfg.verify_mode:
             await asyncio.sleep(max(0.01, float(self._cfg.mode_settle_s)))
             return
         deadline = monotonic_s() + float(self._cfg.mode_set_timeout_s)
         while True:
-            mode_disp = await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+            mode_disp = await self._od.MODES_OF_OPERATION_DISPLAY.read()
             if mode_disp == MODE_PROFILE_POSITION:
                 return
             if monotonic_s() >= deadline:
@@ -75,11 +77,11 @@ class ProfilePosition:
         dec = self._cfg.deceleration if deceleration is None else deceleration
 
         if pv is not None:
-            await self._od.write_u32(int(ODIndex.PROFILE_VELOCITY), int(pv), 0)
+            await self._od.PROFILE_VELOCITY.write(int(pv))
         if acc is not None:
-            await self._od.write_u32(int(ODIndex.PROFILE_ACCELERATION), int(acc), 0)
+            await self._od.PROFILE_ACCELERATION.write(int(acc))
         if dec is not None:
-            await self._od.write_u32(int(ODIndex.PROFILE_DECELERATION), int(dec), 0)
+            await self._od.PROFILE_DECELERATION.write(int(dec))
 
     async def move_to(self, target_position: int, *, relative: bool = False, immediate: bool = True, timeout_s: float | None = None) -> None:
         """Command a move to target_position and wait until 'target reached' bit is set.
@@ -93,7 +95,7 @@ class ProfilePosition:
             relative: if True, interpret as relative move (CW bit 6)
             immediate: if True, set CW bit 5 (change set immediately) when pulsing new set-point
             timeout_s: override default move timeout
-        
+
         Raises:
             ValueError: If relative=False and target_position < 0 (absolute position cannot be negative)
         """
@@ -103,25 +105,25 @@ class ProfilePosition:
                 f"Absolute position cannot be negative (relative=False, target_position={target_position}). "
                 "Per manual requirement: if Absolute (bit6=0), position must be >= 0 after homing."
             )
-        
+
         await self.ensure_mode()
         await self.configure()
-        
+
         _LOGGER.info("PP: move_to target=%d relative=%s immediate=%s", target_position, relative, immediate)
-        await self._od.write_i32(int(ODIndex.TARGET_POSITION), int(target_position), 0)
-        
+        await self._od.TARGET_POSITION.write(int(target_position))
+
         # Barrier cycle: per manual, wait one system cycle after configuration before start
         # Per manual requirement: after parameterizing mode objects, wait one system cycle
         # before sending Start Command via Controlword bit 4.
         # We ensure this by: (1) reading statusword as a round-trip barrier to ensure
         # the drive has processed parameter changes, (2) adding explicit system cycle delay.
-        await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+        await self._od.STATUSWORD.read()
         # Explicit system cycle delay (typical drive cycle: 1-5ms, use configurable delay)
         await asyncio.sleep(self._cfg.system_cycle_delay_s)
         # Per manual: after Operation Enabled, bits 0..3 must always be sent
         # Start with base containing hold bits (0x000F)
         base = cw_enable_operation()  # 0x000F = bits 0,1,2,3 set
-        
+
         if immediate:
             base = cw_set_bits(base, CWBit.CHANGE_SET_IMMEDIATELY)
         else:
@@ -136,11 +138,11 @@ class ProfilePosition:
         set_word, clear_word = cw_pulse_new_set_point(base)
 
         # Rising edge on NEW_SET_POINT
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(set_word) & 0xFFFF, 0)
+        await self._od.CONTROLWORD.write(int(set_word) & 0xFFFF)
         # Keep bit4 high for at least one system cycle so the drive latches
         # the start command reliably (avoids missed pulse on some firmware).
         await asyncio.sleep(self._cfg.system_cycle_delay_s)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(clear_word) & 0xFFFF, 0)
+        await self._od.CONTROLWORD.write(int(clear_word) & 0xFFFF)
 
         # PP handshake - after Start, wait for command acknowledgment
         # Per manual: after Start (bit4), drive resets bit10 and sets bit12,
@@ -185,11 +187,11 @@ class ProfilePosition:
 
     async def halt(self, *, enabled: bool = True) -> None:
         """Halt movement in Profile Position mode using Controlword HALT bit (bit 8).
-        
+
         In Profile Position mode, the HALT bit (bit 8) is typically used to stop
         movement immediately, rather than quick_stop. This is the standard CiA402
         method for stopping motion in profile modes.
-        
+
         Args:
             enabled: If True, set HALT bit to stop movement. If False, clear HALT bit.
         """
@@ -198,19 +200,19 @@ class ProfilePosition:
         # Start with base containing hold bits (0x000F)
         base = cw_enable_operation()  # 0x000F = bits 0,1,2,3 set
         word = cw_set_bits(base, CWBit.HALT) if enabled else cw_clear_bits(base, CWBit.HALT)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(word) & 0xFFFF, 0)
+        await self._od.CONTROLWORD.write(int(word) & 0xFFFF)
 
     async def stop(self) -> None:
         """Stop movement in Profile Position mode using normal deceleration.
-        
+
         According to the manual, "Stop" command stops movement with a pre-set rate
         of deceleration (Profile Deceleration, 0x6084). This is different from
         Quick Stop which uses Quick Stop Deceleration (0x6085).
-        
+
         In Profile Position mode, the standard way to stop with normal deceleration
         is to use the HALT bit (bit 8). The drive will decelerate using the configured
         Profile Deceleration value.
-        
+
         Note: This method uses HALT bit which is the standard CiA402 method for
         stopping motion in profile modes with normal deceleration.
         """
@@ -218,33 +220,31 @@ class ProfilePosition:
 
     async def _wait_start_acknowledgment(self, *, timeout_s: float = 0.5) -> bool:
         """Wait for Start command acknowledgment (M3: PP handshake).
-        
+
         Per manual: after Start (bit4), the drive should:
         - Reset bit10 (target_reached) OR
         - Set bit12 (op_mode_specific) to confirm command acceptance
-        
+
         Returns True if acknowledgment was observed (bit10 transitioned to 0
         or motion already completed),
         False if timed out without seeing bit10 clear.
         """
         deadline = monotonic_s() + timeout_s
         while True:
-            sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+            sw = await self._od.STATUSWORD.read()
             target_reached = _bit(sw, int(SWBit.TARGET_REACHED))
             op_mode_specific = _bit(sw, int(SWBit.OP_MODE_SPECIFIC))
             # Command acknowledged if: bit10 cleared OR bit12 set
             if not target_reached or op_mode_specific:
                 return True
-            
+
             if monotonic_s() >= deadline:
                 # Timeout: bit10 never cleared.  This can happen when the
                 # move completes faster than one poll cycle (the transient
                 # bit10=0 was never observed).  Check if actual position
                 # already matches the target — if so, declare success.
-                target_pos = await self._od.read_i32(
-                    int(ODIndex.TARGET_POSITION), 0)
-                actual_pos = await self._od.read_i32(
-                    int(ODIndex.POSITION_ACTUAL_VALUE), 0)
+                target_pos = await self._od.TARGET_POSITION.read()
+                actual_pos = await self._od.POSITION_ACTUAL_VALUE.read()
                 _LOGGER.info(
                     "PP: _wait_start_ack timeout — target_reached=%s, "
                     "target_pos=%d, actual_pos=%d, delta=%d",
@@ -263,7 +263,7 @@ class ProfilePosition:
 
         async def _read_mode_display_safe() -> int | None:
             try:
-                return await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+                return await self._od.MODES_OF_OPERATION_DISPLAY.read()
             except Exception:
                 return None
 
@@ -275,7 +275,7 @@ class ProfilePosition:
             while True:
                 if self._abort is not None and self._abort.is_set():
                     raise MotionAborted("Motion aborted by stop command")
-                sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+                sw = await self._od.STATUSWORD.read()
                 if not _bit(sw, int(SWBit.TARGET_REACHED)):
                     break  # bit10 finally cleared → now wait for real rising edge
                 if _bit(sw, int(SWBit.FAULT)):
@@ -299,11 +299,11 @@ class ProfilePosition:
                 raise MotionAborted("Motion aborted by stop command")
 
             loop_time = monotonic_s()
-            sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+            sw = await self._od.STATUSWORD.read()
             if _bit(sw, int(SWBit.TARGET_REACHED)):
                 _LOGGER.info("PP: target reached")
                 return
-            
+
             # Check for fault condition
             if _bit(sw, int(SWBit.FAULT)):
                 decoded = decode_statusword(sw)
@@ -311,12 +311,12 @@ class ProfilePosition:
                     f"Fault detected while waiting for target reached. "
                     f"statusword=0x{int(sw) & 0xFFFF:04X}, flags={decoded}"
                 )
-            
+
             if loop_time >= deadline:
                 # Provide more diagnostic information on timeout
                 decoded = decode_statusword(sw)
-                target_pos = await self._od.read_i32(int(ODIndex.TARGET_POSITION), 0)
-                actual_pos = await self._od.read_i32(int(ODIndex.POSITION_ACTUAL_VALUE), 0)
+                target_pos = await self._od.TARGET_POSITION.read()
+                actual_pos = await self._od.POSITION_ACTUAL_VALUE.read()
                 mode_display = await _read_mode_display_safe()
                 position_error = abs(actual_pos - target_pos)
                 raise TimeoutError(

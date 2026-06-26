@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from dryve_d1.od.indices import ObjectDictionary
+
 _LOGGER = logging.getLogger(__name__)
 
 from ..od.controlword import CWBit, cw_fault_reset, cw_set_bits, cw_shutdown
@@ -53,26 +55,27 @@ class FaultInfo:
 class FaultManager:
     """Reads fault diagnostics and performs a fault reset sequence."""
 
-    def __init__(self, od: AsyncODAccessor, *, hooks: DeviceHooks | None = None) -> None:
-        self._od = od
+    def __init__(self, accessor: AsyncODAccessor, *, hooks: DeviceHooks | None = None) -> None:
+        self._accessor = accessor
+        self._od = ObjectDictionary(accessor)
         if hooks is None:
             from ..plugin import NullDeviceHooks
             hooks = NullDeviceHooks()
         self._hooks = hooks
 
     async def read_statusword(self) -> int:
-        return int(await self._od.read_u16(int(ODIndex.STATUSWORD), 0)) & _U16_MASK
+        return int(await self._od.STATUSWORD.read()) & _U16_MASK
 
     async def read_error_code(self) -> int:
-        return int(await self._od.read_u16(int(ODIndex.ERROR_CODE), 0)) & _U16_MASK
+        return int(await self._od.ERROR_CODE.read()) & _U16_MASK
 
     async def read_error_register(self) -> int:
-        return int(await self._od.read_u16(OD_ERROR_REGISTER, 0)) & 0x00FF
+        return int(await self._od.OD_ERROR_REGISTER.read()) & 0x00FF
 
     async def read_error_history(self, *, max_entries: int = 8) -> list[int]:
         """Read Pre-defined Error Field (0x1003) if present."""
         try:
-            count = int(await self._od.read_u16(OD_PREDEFINED_ERROR_FIELD, 0)) & 0x00FF
+            count = int(await self._od.OD_PREDEFINED_ERROR_FIELD.read()) & 0x00FF
         except (TimeoutError, OSError, ConnectionError):
             _LOGGER.debug("Error history unavailable (connection issue)", exc_info=True)
             return []
@@ -83,7 +86,7 @@ class FaultManager:
         hist: list[int] = []
         for si in range(1, count + 1):
             try:
-                hist.append(int(await self._od.read_u16(OD_PREDEFINED_ERROR_FIELD, si)) & _U16_MASK)
+                hist.append(int(await self._od.OD_PREDEFINED_ERROR_FIELD.read(si)) & _U16_MASK)
             except (TimeoutError, OSError, ConnectionError):
                 _LOGGER.debug("Error history entry %d unavailable (connection issue)", si, exc_info=True)
                 break
@@ -136,13 +139,13 @@ class FaultManager:
             return
         self._hooks.pre_state_transition(sw0)
 
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(cw_fault_reset()) & _U16_MASK, 0)
+        await self._od.CONTROLWORD.write(int(cw_fault_reset()) & _U16_MASK)
         await asyncio.sleep(poll_interval_s)
 
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(cw_shutdown()) & _U16_MASK, 0)
+        await self._od.CONTROLWORD.write(int(cw_shutdown()) & _U16_MASK)
 
         safe_halt_shutdown = cw_set_bits(cw_shutdown(), CWBit.HALT)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(safe_halt_shutdown) & _U16_MASK, 0)
+        await self._od.CONTROLWORD.write(int(safe_halt_shutdown) & _U16_MASK)
 
         deadline = monotonic_s() + float(timeout_s)
         while True:

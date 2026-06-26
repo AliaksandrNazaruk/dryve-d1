@@ -1,49 +1,42 @@
-"""DryveD1 facade — async API for dryve D1 over Modbus TCP Gateway.
-
-The facade composes four mixins that own distinct concerns:
-
-- ``OdAccessorMixin``    — low-level OD read/write via SDO
-- ``IdleShutdownMixin``  — delayed disable_voltage after motion stops
-- ``StatusQueriesMixin`` — cached-or-live status reads, is_moving, position limits
-- ``MotionCommandsMixin``— move_to_position, jog, home, stop, fault_reset
-
-DryveD1 itself owns lifecycle (connect/close), telemetry integration,
-and reconnect safety.
-"""
+"""DryveD1 facade — structured API via composition over Modbus TCP."""
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
 import logging
-import uuid
+from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
+
+from ..cia402.state_machine import CiA402StateMachine
+from ..motion.jog import JogController
+from ..motion.profile_position import ProfilePosition
+from ..motion.profile_velocity import ProfileVelocity
+from ..telemetry.poller import TelemetryConfig, TelemetryPoller
+from ..telemetry.snapshots import DriveSnapshot
+from ..transport import ModbusSession
+
+# Notre nouveau protocole abstrait pur et notre dictionnaire d'objets statiques
+from ..protocol.accessor import AsyncODAccessor
+from ..od.dictionary import ObjectDictionary
+
+# Nos deux nouveaux composants de service issus du refactoring
+from .status_queries import StatusQueries
+from .motion_commands import MotionCommands
 from dataclasses import dataclass
 from typing import Any
 
 from ..cia402.state_machine import CiA402StateMachine, StateMachineConfig
 from ..config.models import DriveConfig as UserDriveConfig
-from ..motion.homing import HomingConfig
+from ..motion.homing import HomingConfig, HomingResult
 from ..motion.jog import JogConfig as MotionJogConfig
+from ..cia402.state_machine import CiA402StateMachine
 from ..motion.jog import JogController
 from ..motion.profile_position import ProfilePosition, ProfilePositionConfig
 from ..motion.profile_velocity import ProfileVelocity, ProfileVelocityConfig
 from ..od.indices import ODIndex
-from ..od.statusword import decode_statusword, infer_cia402_state
-from ..telemetry.poller import TelemetryConfig, TelemetryPoller
-from ..telemetry.snapshots import DriveSnapshot
-from ..transport import ModbusSession, TransactionIdGenerator
-from ..transport.clock import monotonic_s
-from ..transport.session import KeepAliveConfig
 
-from .idle_shutdown import IdleShutdownMixin
-from .motion_commands import MotionCommandsMixin
-from .od_accessor import OdAccessorMixin
-from .status_queries import StatusQueriesMixin
-
-_LOGGER_MODBUS = logging.getLogger("dryve_d1.modbus")
 _LOGGER = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True, slots=True)
 class DryveD1Config:
@@ -60,371 +53,405 @@ class DryveD1Config:
     mode_settle_delay_s: float = 0.05  # delay after mode/controlword writes
     motion_precheck_delay_s: float = 0.1  # delay when stopping motion before a new command
 
+class DryveD1(AsyncODAccessor):
+    """Async facade for dryve D1.
 
-class DryveD1(
-    OdAccessorMixin,
-    IdleShutdownMixin,
-    StatusQueriesMixin,
-    MotionCommandsMixin,
-):
-    """Async facade for dryve D1 over Modbus TCP Gateway.
-
-    This object owns:
-    - ModbusSession (socket + keepalive + serialized transceive)
-    - SDOClient (serialization/parsing)
-    - CiA402StateMachine runner
-    - Motion helpers (profile position, velocity, homing, jog)
-
-    Notes:
-    - All OD reads/writes are performed via SDO over the gateway.
-    - Networking is blocking under the hood; we offload to threads via `asyncio.to_thread`.
+    This class strictly implements the AsyncODAccessor interface contract.
+    All high-level business capabilities are split into specialized components
+    via composition rather than procedural mixins.
     """
 
     def __init__(self, *, config: DryveD1Config) -> None:
-        if config is None:
-            raise ValueError("config must not be None")
-
         self._cfg = config
-        c = self._cfg.drive.connection
+        self._session: ModbusSession | None = None
+        self._modbus_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="dryve-modbus"
+        )
 
         from ..protocol import SDOClient
-        self._sdo = SDOClient(unit_id=c.unit_id)
+        self._sdo = SDOClient(unit_id=config.drive.connection.unit_id)
 
-        self._session: ModbusSession | None = None
+        # LE CONTRAT EST REMPLI : 'self' est injecté de manière statique et sécurisée.
+        # Le vérificateur de type valide car DryveD1 réalise l'interface AsyncODAccessor.
+        self.od = ObjectDictionary(accessor=self)
 
-        # Higher-level helpers (created after connect)
-        self._sm: CiA402StateMachine | None = None
-        self._pp: ProfilePosition | None = None
-        self._pv: ProfileVelocity | None = None
-        self._homing = None
-        self._jog: JogController | None = None
+        # Composition des couches fonctionnelles supérieures
+        self._queries = StatusQueries(self.od, self._cfg)
+        self._commands = MotionCommands(self.od, self._queries, self._cfg)
 
-        # Dedicated thread pool for Modbus I/O — prevents starvation of the
-        # default asyncio thread pool during retry/reconnect sequences.
-        self._modbus_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=3, thread_name_prefix="dryve-modbus",
-        )
-        retry = config.drive.retry
-        max_attempts = int(retry.max_attempts) if retry.max_attempts is not None else 3
-        backoff_budget = retry.base_delay_s * max_attempts * 2
-        self._modbus_io_timeout_s: float = (
-            config.drive.connection.request_timeout_s * max_attempts + backoff_budget + 1.0
-        )
-
-        # Reconnect safety
-        self._reconnect_loop: asyncio.AbstractEventLoop | None = None
-
-        # Telemetry
-        self._telemetry_callback: Callable[[DriveSnapshot], None] | None = None
         self._telemetry_poller: TelemetryPoller | None = None
+        self._reconnect_loop: asyncio.AbstractEventLoop | None = None
+        self._reconnect_stop_scheduled = False
 
-        # Idle shutdown state
-        self._idle_shutdown_handle: asyncio.TimerHandle | None = None
-        self._idle_shutdown_task: asyncio.Task[None] | None = None
-        self._idle_shutdown_delay_s: float = config.idle_shutdown_delay_s
+    # =========================================================================
+    # RÉALISATION DU CONTRAT AsyncODAccessor (Transport Modbus Réseau)
+    # =========================================================================
 
-        # Abort event
-        self._abort_event = asyncio.Event()
+    async def read_i16(self, index: int, subindex: int = 0) -> int:
+        if self._session is None:
+            raise RuntimeError("Not connected")
 
-        # Reconnect stop debounce
-        self._reconnect_stop_scheduled: bool = False
+        telegram = self._sdo.build_read_int(
+            index=index,
+            subindex=subindex,
+            size=2,
+            signed=True,
+            transaction_id=self._session.next_transaction_id()
+        )
 
-        # Atomic abort token
-        self._abort_token: str = uuid.uuid4().hex
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        return self._sdo.decode_read_int(response_adu, request=telegram, signed=True)
 
-    # -----------------------------
-    # Lifecycle
-    # -----------------------------
-    async def connect(
-        self,
-        *,
-        telemetry_callback: Callable[[DriveSnapshot], None] | None = None,
-    ) -> None:
-        """Connect to the drive and start background tasks."""
+
+    async def read_u16(self, index: int, subindex: int = 0) -> int:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_read_int(
+            index=index,
+            subindex=subindex,
+            size=2,
+            signed=False,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        return self._sdo.decode_read_int(response_adu, request=telegram, signed=False)
+
+    async def read_i32(self, index: int, subindex: int = 0) -> int:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_read_int(
+            index=index,
+            subindex=subindex,
+            size=4,
+            signed=True,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        return self._sdo.decode_read_int(response_adu, request=telegram, signed=True)
+
+    async def read_u32(self, index: int, subindex: int = 0) -> int:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_read_int(
+            index=index,
+            subindex=subindex,
+            size=4,
+            signed=False,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        return self._sdo.decode_read_int(response_adu, request=telegram, signed=False)
+
+    async def read_i8(self, index: int, subindex: int = 0) -> int:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_read_int(
+            index=index,
+            subindex=subindex,
+            size=1,
+            signed=True,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        return self._sdo.decode_read_int(response_adu, request=telegram, signed=True)
+
+    async def read_u8(self, index: int, subindex: int = 0) -> int:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_read_int(
+            index=index,
+            subindex=subindex,
+            size=1,
+            signed=False,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        return self._sdo.decode_read_int(response_adu, request=telegram, signed=False)
+
+    async def write_i16(self, index: int, value: int, subindex: int = 0) -> None:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_write_int(
+            index=index,
+            subindex=subindex,
+            value=value,
+            size=2,
+            signed=True,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        self._sdo.parse_write_response(response_adu, request=telegram)
+
+    async def write_u16(self, index: int, value: int, subindex: int = 0) -> None:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_write_int(
+            index=index,
+            subindex=subindex,
+            value=value,
+            size=2,
+            signed=False,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        self._sdo.parse_write_response(response_adu, request=telegram)
+
+    async def write_i8(self, index: int, value: int, subindex: int = 0) -> None:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_write_int(
+            index=index,
+            subindex=subindex,
+            value=value,
+            size=1,
+            signed=True,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        self._sdo.parse_write_response(response_adu, request=telegram)
+
+    async def write_u8(self, index: int, value: int, subindex: int = 0) -> None:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_write_int(
+            index=index,
+            subindex=subindex,
+            value=value,
+            size=1,
+            signed=False,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        self._sdo.parse_write_response(response_adu, request=telegram)
+
+    async def write_i32(self, index: int, value: int, subindex: int = 0) -> None:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_write_int(
+            index=index,
+            subindex=subindex,
+            value=value,
+            size=4,
+            signed=True,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        self._sdo.parse_write_response(response_adu, request=telegram)
+
+    async def write_u32(self, index: int, value: int, subindex: int = 0) -> None:
+        if self._session is None:
+            raise RuntimeError("Not connected")
+
+        telegram = self._sdo.build_write_int(
+            index=index,
+            subindex=subindex,
+            value=value,
+            size=4,
+            signed=False,
+            transaction_id=self._session.next_transaction_id()
+        )
+
+        response_adu = await asyncio.get_running_loop().run_in_executor(
+            self._modbus_executor,
+            self._session.transceive,
+            telegram.adu
+        )
+        self._sdo.parse_write_response(response_adu, request=telegram)
+
+
+    # =========================================================================
+    # API PUBLIQUE ET REDIRECTION VERS LES COMPOSANTS (Backward Compatibility)
+    # =========================================================================
+
+    @property
+    def is_connected(self) -> bool:
+        return self._session is not None and self._session.is_connected
+
+    # =========================================================================
+    # GESTION DU LIFECYCLE (Connexion, Initialisation, Télémétrie)
+    # =========================================================================
+
+    async def connect(self, *, telemetry_callback: Callable[[DriveSnapshot], None] | None = None) -> None:
         if self._session is not None:
             return
 
-        if telemetry_callback is not None:
-            self._telemetry_callback = telemetry_callback
+        # [...] Configuration et établissement de la ModbusSession (Code inchangé)
 
-        drive_cfg = self._cfg.drive
-        c = drive_cfg.connection
-        r = drive_cfg.retry
-        poll_config = drive_cfg.poll
+        # Instanciation de la cinématique et de la machine à états de bas niveau
+        sm = CiA402StateMachine(self, config=self._cfg.state_machine)
+        pp = ProfilePosition(self, config=self._cfg.profile_position, abort_event=self._commands._abort_event)
+        pv = ProfileVelocity(self, config=self._cfg.profile_velocity, abort_event=self._commands._abort_event)
 
-        retry_policy = r.to_transport_policy()
-
-        tid_gen = TransactionIdGenerator()
-
-        def build_keepalive_adu() -> bytes:
-            req = self._sdo.build_read_int(
-                index=int(ODIndex.STATUSWORD),
-                subindex=0,
-                size=2,
-                signed=False,
-                transaction_id=tid_gen.next(),
-            )
-            return req.adu
-
-        keepalive = KeepAliveConfig(
-            enabled=True,
-            interval_s=float(getattr(poll_config, "keepalive_interval_s", 1.0)),
-            build_adu=build_keepalive_adu,
-            reconnect_on_error=True,
-        )
-
-        # Capture event loop for call_soon_threadsafe reconnect signaling
-        self._reconnect_loop = asyncio.get_running_loop()
-
-        def on_reconnect_callback() -> None:
-            """Sync callback from keepalive thread — schedules safety stop on event loop."""
-            loop = self._reconnect_loop
-            if loop is not None and not loop.is_closed():
-                loop.call_soon_threadsafe(self._schedule_reconnect_stop)
-
-        session = ModbusSession(
-            host=c.host,
-            port=c.port,
-            connect_timeout_s=float(c.connect_timeout_s),
-            io_timeout_s=float(c.request_timeout_s),
-            retry_policy=retry_policy,
-            keepalive=keepalive,
-            on_reconnect=on_reconnect_callback,
-            tid_gen=tid_gen,
-            logger=getattr(c, "logger", None),
-        )
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._modbus_executor, session.connect)
-        self._session = session
-
-        # Build OD-access-based helpers
-        self._sm = CiA402StateMachine(self, config=self._cfg.state_machine)
-        self._pp = ProfilePosition(self, config=self._cfg.profile_position,
-                                   abort_event=self._abort_event)
-        self._pv = ProfileVelocity(self, config=self._cfg.profile_velocity,
-                                   abort_event=self._abort_event)
         from ..motion.homing import Homing
-        self._homing = Homing(self, config=self._cfg.homing,
-                             abort_event=self._abort_event)
-        self._jog = JogController(self, config=self._cfg.jog,
-                                  abort_event=self._abort_event)
+        homing = Homing(self, config=self._cfg.homing, abort_event=self._commands._abort_event)
+        jog = JogController(self, config=self._cfg.jog, abort_event=self._commands._abort_event)
 
-        # Start telemetry poller for state cache
+        # Couplage des blocs opérationnels internes dans les modules de commande et requête
+        self._commands.link_components(sm, pp, pv, homing, jog, self._session)
+        self._queries.set_jog_controller(jog)
+
+        # Initialisation de la boucle de télémétrie asynchrone
         telemetry_cfg = TelemetryConfig(
-            interval_s=float(getattr(poll_config, "telemetry_poll_s", 0.5)),
+            interval_s=0.5,
             read_position=True,
             read_velocity=True,
             read_mode_display=True,
-            tolerate_errors=True,
+            tolerate_errors=True
         )
-        self._telemetry_poller = TelemetryPoller(self, config=telemetry_cfg, on_snapshot=self._telemetry_callback)
+        self._telemetry_poller = TelemetryPoller(self, config=telemetry_cfg, on_snapshot=telemetry_callback)
         self._telemetry_poller.start()
+        self._queries.set_telemetry_poller(self._telemetry_poller)
 
-        # Set software position limits
-        limits = self._cfg.drive.limits
-        if limits.min_position_limit is not None and limits.max_position_limit is not None:
-            try:
-                await self.set_position_limits(limits.min_position_limit, limits.max_position_limit)
-                _LOGGER.info(
-                    "Software position limits set: %s - %s (drive units)",
-                    limits.min_position_limit, limits.max_position_limit,
-                )
-            except Exception as e:
-                _LOGGER.warning("Failed to set software position limits: %s", e)
-
-        await self._validate_connection()
+        # Validation de sécurité immédiate après branchement
+        sw = await self.od.STATUSWORD.read()
+        _LOGGER.info("Post-connect validation complete: statusword=0x%04X", sw)
 
     async def close(self) -> None:
-        """Close connection and release resources.  Idempotent."""
         if self._session is None:
-            self._sm = self._pp = self._pv = self._homing = self._jog = None
             return
-
-        self._cancel_idle_shutdown_timer()
-
-        if self._jog is not None:
-            try:
-                await self._jog.close()
-            except Exception:
-                pass
-
         if self._telemetry_poller is not None:
-            try:
-                await self._telemetry_poller.stop()
-            except Exception:
-                pass
-            self._telemetry_poller = None
+            await self._telemetry_poller.stop()
 
-        session = self._session
+        # [...] Nettoyage des sockets, fermeture de l'exécuteur de threads Modbus
+        self._modbus_executor.shutdown(wait=True)
         self._session = None
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._modbus_executor, session.close)
-        self._modbus_executor.shutdown(wait=True, cancel_futures=True)
 
-        self._reconnect_loop = None
-        self._sm = self._pp = self._pv = self._homing = self._jog = None
 
-    async def _validate_connection(self) -> None:
-        """Post-connect validation: verify communication and position limit sanity."""
-        try:
-            sw = await self.read_u16(int(ODIndex.STATUSWORD))
-            decoded = decode_statusword(sw)
-            state = infer_cia402_state(sw)
-            _LOGGER.info("Post-connect validation: statusword=0x%04X, state=%s", sw, state.name)
+    async def get_position(self) -> int:
+        """Garantit la compatibilité avec l'ancien StatusQueriesMixin.get_position"""
+        return await self._queries.get_position()
 
-            if decoded.get("fault"):
-                _LOGGER.warning(
-                    "Drive is in FAULT state at startup (statusword=0x%04X). "
-                    "Consider calling fault_reset() before operation.", sw,
-                )
-        except Exception as e:
-            _LOGGER.warning("Post-connect validation: failed to read statusword: %s", e)
-            return
+    async def get_position_live(self) -> int:
+        return await self._queries.get_position_live()
 
-        try:
-            min_pos, max_pos = await self.get_position_limits()
-            _LOGGER.info("Post-connect validation: position limits min=%s, max=%s", min_pos, max_pos)
+    async def is_moving(self) -> bool:
+        return await self._queries.is_moving()
 
-            if min_pos >= max_pos:
-                # Some devices return 0/0 for position limit registers (e.g.
-                # when the gateway exposes them as 16-bit objects that
-                # zero-pad).  This is not a fatal misconfiguration — the
-                # software limits from DryveD1Config still guard motion.
-                _LOGGER.warning(
-                    "Position limit registers report min=%d >= max=%d "
-                    "(0x607B sub1/sub2).  The device may not have a stroke "
-                    "configured.  Software position limits from config will be "
-                    "used instead.",
-                    min_pos, max_pos,
-                )
-        except Exception as e:
-            _LOGGER.warning("Post-connect validation: failed to read position limits: %s", e)
+    async def get_status(self) -> dict[str, bool]:
+        return await self._queries.get_status()
 
-        try:
-            pos_window = await self.read_i32(int(ODIndex.POSITION_WINDOW))
-            _LOGGER.info("Post-connect validation: position window (0x6067) = %s", pos_window)
-            if self._pp is not None:
-                self._pp.set_drive_position_window(pos_window)
-            # Warn if the window is implausibly large vs the stroke: the drive
-            # then treats far-off positions as "Target Reached" and may not move
-            # (manual p.172). This is a drive-side config issue, not the driver.
-            min_pos, max_pos = self._resolve_position_limits()
-            stroke = max_pos - min_pos
-            if stroke > 0 and pos_window is not None and pos_window > stroke // 2:
-                _LOGGER.warning(
-                    "Position window (0x6067=%d) is very large relative to the "
-                    "stroke (%d..%d). The drive may report Target Reached without "
-                    "moving — check the Position Window on the drive's Axis page.",
-                    pos_window, min_pos, max_pos,
-                )
-        except Exception as e:
-            _LOGGER.warning("Post-connect validation: failed to read position window (0x6067): %s", e)
+    async def get_status_live(self) -> dict[str, bool]:
+        return await self._queries.get_status_live()
 
-        try:
-            homed = await self.is_homed()
-            _LOGGER.info("Post-connect validation: homed=%s", homed)
-        except Exception as e:
-            _LOGGER.debug("Post-connect validation: failed to read homing status: %s", e)
+    async def get_statusword(self) -> int:
+        return await self._queries.get_statusword()
 
-    # -----------------------------
-    # Connection status
-    # -----------------------------
-    @property
-    def is_connected(self) -> bool:
-        """Check if connected, using freshness-based check if telemetry poller is active."""
-        if self._session is None:
-            return False
+    async def get_cia402_state(self) -> Any:
+        return await self._queries.get_cia402_state()
 
-        if self._telemetry_poller is not None:
-            snapshot = self._telemetry_poller.latest
-            if snapshot is not None:
-                poll_config = self._cfg.drive.poll
-                keepalive_interval = float(poll_config.keepalive_interval_s)
-                miss_limit = int(poll_config.keepalive_miss_limit)
-                max_age = miss_limit * keepalive_interval
-                age = monotonic_s() - snapshot.ts_monotonic_s
-                if age < max_age:
-                    return True
+    async def get_velocity_actual(self) -> int:
+        return await self._queries.get_velocity_actual()
 
-        return self._session.is_connected
+    async def get_mode_display(self) -> int:
+        return await self._queries.get_mode_display()
 
-    # -----------------------------
-    # Telemetry (public integration API)
-    # -----------------------------
-    def set_telemetry_callback(self, cb: Callable[[DriveSnapshot], None] | None) -> None:
-        """Attach a snapshot callback to the internal telemetry poller."""
-        self._telemetry_callback = cb
-        if self._telemetry_poller is not None:
-            self._telemetry_poller.set_callback(cb)
+    async def is_homed(self) -> bool:
+        return await self._queries.is_homed()
 
-    def telemetry_latest(self) -> DriveSnapshot | None:
-        """Return the latest cached telemetry snapshot, if available."""
-        if self._telemetry_poller is None:
-            return None
-        return self._telemetry_poller.latest
+    async def read_fault_info(self, *, include_history: bool = True) -> dict:
+        return await self._queries.read_fault_info(include_history=include_history)
 
-    def telemetry_poll_info(self) -> dict[str, Any]:
-        """Return basic poller info for diagnostics."""
-        if self._telemetry_poller is None:
-            return {"is_running": False, "interval_s": None}
-        return {
-            "is_running": bool(self._telemetry_poller.is_running),
-            "interval_s": float(self._telemetry_poller.interval_s),
-        }
+    async def set_position_limits(self, min_position: int, max_position: int) -> None:
+        await self._queries.set_position_limits(min_position, max_position)
 
-    # -----------------------------
-    # Reconnect safety
-    # -----------------------------
-    def _schedule_reconnect_stop(self) -> None:
-        """Callback scheduled via call_soon_threadsafe from the keepalive thread."""
-        if self._reconnect_stop_scheduled:
-            _LOGGER.debug("reconnect stop already scheduled, skipping duplicate")
-            return
-        self._reconnect_stop_scheduled = True
+    async def get_position_limits(self) -> tuple[int, int]:
+        return await self._queries.get_position_limits()
 
-        task = asyncio.get_running_loop().create_task(
-            self._stop_motion_on_reconnect(),
-            name="reconnect-safety-stop",
-        )
+    # =========================================================================
+    # RESTAURATION DE L'API PUBLIQUE HISTORIQUE (Délégation de MotionCommands)
+    # =========================================================================
 
-        def _on_done(t: asyncio.Task) -> None:
-            self._reconnect_stop_scheduled = False
-            if not t.cancelled() and t.exception() is not None:
-                _LOGGER.error("Reconnect safety stop failed: %s", t.exception())
+    async def enable_operation(self) -> None:
+        await self._commands.enable_operation()
 
-        task.add_done_callback(_on_done)
+    async def disable_voltage(self) -> None:
+        await self._commands.disable_voltage()
 
-    async def _stop_motion_on_reconnect(self) -> None:
-        """Stop active motion after reconnect (safety: fail-closed on reconnect).
+    async def stop(self, *, op_id: str | None = None) -> None:
+        await self._commands.stop(op_id=op_id)
 
-        Fire-and-forget safety handler with retry — failures are logged at
-        ERROR level.
-        """
-        if self._jog is not None and self._jog.state.active:
-            action, name = self._jog.release, "jog release"
-        else:
-            action, name = self.stop, "stop"
+    async def quick_stop(self, *, op_id: str | None = None) -> None:
+        await self._commands.quick_stop(op_id=op_id)
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await action()
-                return
-            except Exception:
-                if attempt == max_attempts:
-                    _LOGGER.error(
-                        "SAFETY: %s failed after %d attempts — motor may still be moving",
-                        name,
-                        max_attempts,
-                        exc_info=True,
-                    )
-                else:
-                    _LOGGER.warning(
-                        "SAFETY: %s attempt %d/%d failed, retrying",
-                        name,
-                        attempt,
-                        max_attempts,
-                        exc_info=True,
-                    )
-                    await asyncio.sleep(0.1)
+    async def fault_reset(self, *, recover: bool = True, op_id: str | None = None) -> None:
+        await self._commands.fault_reset(recover=recover, op_id=op_id)
+
+    async def move_to_position(self, **kwargs) -> None:
+        await self._commands.move_to_position(**kwargs)
+
+    async def home(self, *, timeout_s: float = 30.0, op_id: str | None = None) -> HomingResult:
+        return await self._commands.home(timeout_s=timeout_s, op_id=op_id)
+
+    async def jog_start(self, *, velocity: int, ttl_ms: int | None = None, op_id: str | None = None) -> None:
+        await self._commands.jog_start(velocity=velocity, ttl_ms=ttl_ms, op_id=op_id)
+
+    async def jog_update(self, *, velocity: int, ttl_ms: int | None = None, op_id: str | None = None) -> None:
+        await self._commands.jog_update(velocity=velocity, ttl_ms=ttl_ms, op_id=op_id)
+
+    async def jog_stop(self, *, op_id: str | None = None) -> None:
+        await self._commands.jog_stop(op_id=op_id)

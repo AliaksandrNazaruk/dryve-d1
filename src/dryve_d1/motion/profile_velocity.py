@@ -13,7 +13,7 @@ from ..od.controlword import (
     cw_pulse_new_set_point,
     cw_set_bits,
 )
-from ..od.indices import ODIndex
+from ..od.indices import ODIndex, ObjectDictionary
 from ..od.statusword import decode_statusword
 from ..protocol.accessor import AsyncODAccessor
 from ..transport.clock import monotonic_s
@@ -48,18 +48,18 @@ class ProfileVelocity:
 
     def __init__(
         self,
-        od: AsyncODAccessor,
+        accessors: AsyncODAccessor,
         *,
         config: ProfileVelocityConfig | None = None,
         abort_event: asyncio.Event | None = None,
     ) -> None:
-        self._od = od
+        self._od = ObjectDictionary(accessors)
         self._cfg = config or ProfileVelocityConfig()
         self._abort: asyncio.Event | None = abort_event
 
     async def ensure_mode(self) -> None:
         _LOGGER.debug("PV: setting mode=%d", MODE_PROFILE_VELOCITY)
-        await self._od.write_u8(int(ODIndex.MODES_OF_OPERATION), MODE_PROFILE_VELOCITY, 0)
+        await self._od.MODES_OF_OPERATION.write(MODE_PROFILE_VELOCITY)
         if not self._cfg.verify_mode:
             # Rely on fixed delay instead of 0x6061 (avoids timeout when gateway returns stale 0x6061)
             await asyncio.sleep(max(0.01, float(self._cfg.mode_settle_s)))
@@ -70,7 +70,7 @@ class ProfileVelocity:
 
         deadline = monotonic_s() + float(self._cfg.mode_set_timeout_s)
         while True:
-            mode_disp = await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+            mode_disp = await self._od.MODES_OF_OPERATION_DISPLAY.read()
             if mode_disp == MODE_PROFILE_VELOCITY:
                 return
             if monotonic_s() >= deadline:
@@ -83,24 +83,24 @@ class ProfileVelocity:
         qsd = self._cfg.quick_stop_decel if quick_stop_decel is None else quick_stop_decel
 
         if acc is not None:
-            await self._od.write_u32(int(ODIndex.PROFILE_ACCELERATION), int(acc), 0)
+            await self._od.PROFILE_ACCELERATION.write(int(acc))
         if dec is not None:
-            await self._od.write_u32(int(ODIndex.PROFILE_DECELERATION), int(dec), 0)
+            await self._od.PROFILE_DECELERATION.write(int(dec))
         if qsd is not None:
-            await self._od.write_u32(int(ODIndex.QUICK_STOP_DECELERATION), int(qsd), 0)
+            await self._od.QUICK_STOP_DECELERATION.write(int(qsd))
 
     async def set_target_velocity(self, velocity: int) -> None:
         """Set Target Velocity (0x60FF). Value is typically INT32."""
         _LOGGER.debug("PV: set_target_velocity=%d", velocity)
-        await self._od.write_i32(int(ODIndex.TARGET_VELOCITY), int(velocity), 0)
+        await self._od.TARGET_VELOCITY.write(int(velocity))
 
     async def latch_new_setpoint(self) -> None:
         """Pulse NEW_SET_POINT (Controlword bit 4) so the drive accepts the new target velocity.
         Some drives (e.g. Dryve D1) require this in Profile Velocity mode to start motion."""
         base = cw_enable_operation()
         set_word, clear_word = cw_pulse_new_set_point(base)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(set_word) & 0xFFFF, 0)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(clear_word) & 0xFFFF, 0)
+        await self._od.CONTROLWORD.write(int(set_word) & 0xFFFF)
+        await self._od.CONTROLWORD.write(int(clear_word) & 0xFFFF)
 
     async def stop_velocity_zero(self) -> None:
         """Stop by commanding target velocity to 0."""
@@ -109,11 +109,11 @@ class ProfileVelocity:
 
     async def stop(self) -> None:
         """Stop movement in Profile Velocity mode using normal deceleration.
-        
+
         According to the manual, "Stop" command stops movement with a pre-set rate
         of deceleration (Profile Deceleration, 0x6084). This is different from
         Quick Stop which uses Quick Stop Deceleration (0x6085).
-        
+
         In Profile Velocity mode, the standard way to stop with normal deceleration
         is to set target velocity to 0. The drive will decelerate using the configured
         Profile Deceleration value.
@@ -136,12 +136,12 @@ class ProfileVelocity:
         # Start with base containing hold bits (0x000F)
         base = cw_enable_operation()  # 0x000F = bits 0,1,2,3 set
         word = cw_set_bits(base, CWBit.HALT) if enabled else cw_clear_bits(base, CWBit.HALT)
-        await self._od.write_u16(int(ODIndex.CONTROLWORD), int(word) & 0xFFFF, 0)
+        await self._od.CONTROLWORD.write(int(word) & 0xFFFF)
 
     async def is_target_reached_flag(self) -> bool:
         """Convenience: read Statusword and return 'target_reached' bit.
 
         In velocity mode this bit may not be meaningful; do not rely on it for motion detection.
         """
-        sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+        sw = await self._od.STATUSWORD.read()
         return bool(decode_statusword(sw).get("target_reached"))

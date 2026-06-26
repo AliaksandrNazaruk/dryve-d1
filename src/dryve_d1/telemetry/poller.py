@@ -87,17 +87,17 @@ class TelemetryPoller:
         while not self._stop_evt.is_set():
             t0 = monotonic_s()
             try:
-                sw = await self._od.read_u16(int(ODIndex.STATUSWORD), 0)
+                sw = self._od.STATUSWORD.read()
                 decoded = decode_statusword(sw)
                 cia_state = infer_cia402_state(sw)
 
                 pos = vel = mode = None
                 if self._cfg.read_position:
-                    pos = await self._od.read_i32(int(ODIndex.POSITION_ACTUAL_VALUE), 0)
+                    pos = await self._od.POSITION_ACTUAL_VALUE.read()
                 if self._cfg.read_velocity:
                     vel = await self._od.read_i32(int(ODIndex.VELOCITY_ACTUAL_VALUE), 0)
                 if self._cfg.read_mode_display:
-                    mode = await self._od.read_i8(int(ODIndex.MODES_OF_OPERATION_DISPLAY), 0)
+                    mode = await self._od.MODES_OF_OPERATION_DISPLAY.read()
 
                 snap = DriveSnapshot(
                     ts_monotonic_s=t0,
